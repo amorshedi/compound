@@ -3257,6 +3257,18 @@ end structure
         for i, p in enumerate(particles):
             total_charge += eval([x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0])
         return total_charge
+    
+    
+    def total_dipole(self, dir, group=None):
+        '''only makes sense after applyff'''
+        
+        particles = group if group else self.particles()
+        
+        total_dipole = 0.0
+        for i, p in enumerate(particles):
+            total_dipole += eval([x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0]) * p.pos[dir] 
+        return total_dipole        
+    
 
     def neutralize(self, types):
         '''only makes sense after applyff'''
@@ -3265,7 +3277,7 @@ end structure
             if x.type['name'] in types:
                 cnt += 1
 
-        adjust = -self.total_charge/cnt
+        adjust = -self.total_charge()/cnt
         for x in types:
             for y in self.ff.nonbond_types:
                 if x == y['type']:
