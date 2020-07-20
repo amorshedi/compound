@@ -3247,11 +3247,14 @@ end structure
         if 'ERROR' in out or proc.returncode != 0:
             _packmol_error(out, err)
 
-    @property
-    def total_charge(self):
-        '''only makes sense after applyff'''
+    def total_charge(self, group=None):
+        '''only makes sense after applyff
+        group: list of particles'''
+
+        particles = group if group else self.particles()
+
         total_charge = 0.0
-        for i, p in enumerate(self.particles()):
+        for i, p in enumerate(particles):
             total_charge += eval([x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0])
         return total_charge
 
