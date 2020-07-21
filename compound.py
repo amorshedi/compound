@@ -31,6 +31,7 @@ from foyer.smarts_graph import SMARTSGraph
 from networkx.algorithms import isomorphism
 import networkx as nx
 from funcs import *
+from orderedset import OrderedSet
 
 #to do list:
 # ForceField from foyer should be in this file somehow
@@ -366,12 +367,11 @@ class Compound(object):
         bond_list = []
         angle_list = []
         nlst = self.particles_label_sorted()
-        for i, bond in enumerate(self.bonds_typed.items(), 1):
-            bond_list.append([nlst.index(j) for j in bond[0]])
-
-        for i, angle in enumerate(self.angles_typed.items(), 1):
-            angle_list.append([nlst.index(j) for j in angle[0]])
-        return bond_list, angle_list
+        for i, bond in enumerate(self.bonds_typed, 1):
+            bond_list.append([nlst.index(j) for j in bond])
+        for i, angle in enumerate(self.angles_typed, 1):
+            angle_list.append([nlst.index(j) for j in angle])
+        return np.array(bond_list), np.array(angle_list)
 
     def n_particles(self,ports=0):
         """Return the number of Particles in the Compound.
@@ -1175,7 +1175,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
 
         self.update_coordinates(os.path.join(tmp_dir, 'minimized.pdb'))
 
-    def update_coordinates(self, filename, update_port_locations=True):
+    def update_coordinates(self, filename, update_port_locations=0):
         """Update the coordinates of this Compound from a file.
         Parameters
         ----------
@@ -1196,7 +1196,8 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             self = compload(filename)
             self._update_port_locations(xyz_init)
         else:
-            self = compload(filename)
+            tmp = compload(filename)
+            self.xyz = tmp.xyz
 
     def _energy_minimize_openmm(
             self,
@@ -2838,8 +2839,8 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             x.type = x.type[0]
 
         # create angles and dihedrals
-        angles = set()
-        propers = set()
+        angles = OrderedSet()
+        propers = OrderedSet()
         for i, part1 in enumerate(nlst):
             for part2 in nlst[i+1:]:
                 tmp = nx.all_simple_paths(self.bond_graph, part1, part2, 4) # type: list
@@ -3257,6 +3258,18 @@ end structure
         for i, p in enumerate(particles):
             total_charge += eval([x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0])
         return total_charge
+    
+    
+    def total_dipole(self, dir, group=None):
+        '''only makes sense after applyff'''
+        
+        particles = group if group else self.particles()
+        
+        total_dipole = 0.0
+        for i, p in enumerate(particles):
+            total_dipole += eval([x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0]) * p.pos[dir] 
+        return total_dipole        
+    
 
     def neutralize(self, types):
         '''only makes sense after applyff'''
@@ -3265,12 +3278,101 @@ end structure
             if x.type['name'] in types:
                 cnt += 1
 
-        adjust = -self.total_charge/cnt
+        adjust = -self.total_charge()/cnt
         for x in types:
             for y in self.ff.nonbond_types:
                 if x == y['type']:
                    y['charge'] = str(float(y['charge']) + adjust)
 
+    def write_gulp(self, direc):
+        from funcs import equivalence_classes
+
+        types = equivalence_classes(self.ff.atom_types, lambda x,y: x['element']==y['element'])
+        
+        type_map = dict()
+        for x in types:
+            for i,y in enumerate(x, 1):
+                type_map[y['name']] = y['element']+str(i)
+        with open(direc, 'w') as f:
+            f.write("opti conp molmec fix noautobond nosym norepulsive_cutoff prop thermal  & \n"
+                             "freq  eigen lower optlower kcal conj\n\n"
+                    'vector\n')
+            f.write((3*(3*'{} '+'\n')).format(*self.latmat.flatten()))
+            
+            f.write('\ncart\n')
+            for x in self.particles_label_sorted():
+                f.write(f'{type_map[x.type["name"]]:4}' + (3*'{:7f}  '+'\n').format(*x.pos))
+
+            f.write('\n')
+            bonds,_ = self.bonds_angles_index
+            for x in bonds + 1:
+                f.write('connect {} {}\n'.format(*x))
+            
+            f.write("\nepsilon/sigma kcal\n")
+            for x in self.ff.nonbond_types:
+                f.write(f"{type_map[x['type']]}  {x['epsilon']}  {x['sigma']} \n")
+
+            f.write("\nlenn epsilon zero product 12  6 x13 kcal all\n")
+            f.write('12\n')
+            f.write("\nharmonic intra bond kcal\n")
+            for x in self.ff.bond_types:
+                f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {2*float(x['k'])}  {x['length']}  0\n")
+
+            f.write("\nthree bond intra regular kcal\n")
+            for x in self.ff.atom_types:
+                f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]}  {2*float(x['k'])}  {x['angle']}\n")
+
+#           "  Oh      Sb     H        100        115"
+#         "  Ob      Si      Si      340        144"
+#         "  Ob      Si      Sb      340        139"
+#         "  Si      Oc      Oc      340        112.5"
+#         "  Si      Oc      Ob      340        111.5"
+#         "  Si      Ob      Ob      340        100.2"
+#         "  Sb     Oh      Oh       340        113"
+#         "  Sb     Oh      Ob       340        111"
+#         "  Sb     Ob      Ob       340        107"
+#         "  Ow      Hw      Hw      100        104.5"
+#         "  Sb     Oh      Od       340        111.5"
+#         "  Sb     Od      Od       340        111.5"
+#         "  Sb     Od      Ob       340        107.4"
+#         "  Sb     Ob      C        88.2       117.3"
+#         "  Sb     Oh      C        88.2       117.3"
+#         "  C       Hc      Hc      79         106.4"
+#         "  C       C       Hc      88.8       110"
+#         "  C       Sb     Hc       69.2       112.3"
+#         "  C       Sb     C        69.2       112.3"
+#         "  C       C       C       93.2       110.5"
+#         ""
+#         "torsion intra bond kcal"
+#         "Ob     Sb   C    Hc   -0.1000      3"
+#         "Ob     Sb   C    C     0.1111      3"
+#         "Oh     Sb   C    Hc   -0.1000      3"
+#         "Oh     Sb   C    C     0.1111      3"
+#         "Hc     C     C    Hc    0.1581      3"
+#         "C      C     C    Hc    0.1581      3"
+#         "Sb    C     C    Hc    0.1581      3"
+#         "Sb    C     C    C     0.1581      3"
+#         "C      C     C    C     0.1581      3"
+
+
+#                         string(ff)
+#                         "cartesian"
+#                         bx.elems(:)+"  "+string(n2s(bx.coords))+"  "+n2s(bx.atom_charge(:))
+#                         ""
+#                         "connect "+string(n2s(bx.bonds(:,2:end)))
+#                         ""
+#                         ..."pressure var"
+#                         ""
+#                         "maxcyc opt     5000"
+#                         "switch_min rfo   gnorm     0.001"
+#                         ""
+#                         "rtol   1.5000"
+#                         "dump every     10 csh0p8.res                                                "
+#                         ""
+#                         "output dcd movie"
+#                         "output xyz movie"
+#                         "temperature 300"
+#                         "slower .01"
 
 class Box:
     def __init__(self, comp):
