@@ -12,7 +12,7 @@ from parmed.periodic_table import AtomicNum, element_by_name, Mass, Element
 
 from os import system as syst
 
-from openbabel import openbabel as ob
+import openbabel as ob
 # from openbabel import pybel as pb
 from itertools import compress as cmp
 from pymatgen.util.coord import pbc_shortest_vectors, get_angle
@@ -424,7 +424,7 @@ class Compound(object):
             return self
         return parent
 
-    def particles_by_name(self, name):
+    def particles_by_name(self, names):
         """Return all Particles of the Compound with a specific name
 
         Parameters
@@ -438,9 +438,11 @@ class Compound(object):
             The next Particle in the Compound with the user-specified name
 
         """
-        for particle in self.particles(1):
-            if particle.name == name:
-                yield particle
+        names = names.split()
+        for name in names:
+            for particle in self.particles(1):
+                if particle.name == name:
+                    yield particle
 
     def add(self, new_child, expand=True,name=None,replace=False,
             inherit_periodicity=True, reset_rigid_ids=True):
@@ -3232,7 +3234,7 @@ end structure
 
         from subprocess import PIPE, Popen
 
-        proc = Popen('{} < {}'.format('~/software/packmol/packmol', f.name),
+        proc = Popen('{} < {}'.format('D:\Mehdi\Molecularbuilder\packmol\packmol', f.name),
                      stdin=PIPE, stdout=PIPE, stderr=PIPE,
                      universal_newlines=True, shell=True)
         out, err = proc.communicate()
@@ -3282,6 +3284,28 @@ end structure
             for y in self.ff.nonbond_types:
                 if x == y['type']:
                    y['charge'] = str(float(y['charge']) + adjust)
+
+
+    def particles_by_type(self, types):
+        '''only makes sense after applyff'''
+        """Return all Particles of the Compound with a specific types
+
+        Parameters
+        ----------
+        name : str
+            Only particles with this name are returned
+
+        Yields
+        ------
+        mb.Compound
+            The next Particle in the Compound with the user-specified name
+
+        """
+        types = types.split()
+        for type in types:
+            for particle in self.particles(1):
+                if particle.type['name'] == type:
+                    yield particle
 
 
 class Box:
