@@ -3272,14 +3272,18 @@ end structure
         return total_dipole        
     
 
-    def neutralize(self, types):
+    def neutralize(self, types, group=None):
         '''only makes sense after applyff'''
+     
+        particles = group if group else self.particles()
+        
         cnt = 0
-        for x in self.particles():
+        for x in particles:
             if x.type['name'] in types:
                 cnt += 1
-
-        adjust = -self.total_charge()/cnt
+        ''' There is something wrong about the line below, somehow adjust becomes zero for group'''
+        
+        adjust = -self.total_charge(group)/cnt if group else -self.total_charge()/cnt
         for x in types:
             for y in self.ff.nonbond_types:
                 if x == y['type']:
