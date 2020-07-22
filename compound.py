@@ -3234,7 +3234,8 @@ end structure
 
         from subprocess import PIPE, Popen
 
-        proc = Popen('{} < {}'.format('D:\Mehdi\Molecularbuilder\packmol\packmol', f.name),
+        tmp = find_file('packmol', sys.path)
+        proc = Popen('{} < {}'.format([x for x in tmp if 'mol/pack' in x][0], f.name),
                      stdin=PIPE, stdout=PIPE, stderr=PIPE,
                      universal_newlines=True, shell=True)
         out, err = proc.communicate()
@@ -3253,6 +3254,7 @@ end structure
         '''only makes sense after applyff
         group: list of particles'''
 
+        group = list(group)
         particles = group if group else self.particles()
 
         total_charge = 0.0
@@ -3263,7 +3265,8 @@ end structure
     
     def total_dipole(self, dir, group=None):
         '''only makes sense after applyff'''
-        
+
+        group = list(group)
         particles = group if group else self.particles()
         
         total_dipole = 0.0
@@ -3274,7 +3277,8 @@ end structure
 
     def neutralize(self, types, group=None):
         '''only makes sense after applyff'''
-     
+
+        group = list(group)
         particles = group if group else self.particles()
         
         cnt = 0
@@ -3283,7 +3287,7 @@ end structure
                 cnt += 1
         ''' There is something wrong about the line below, somehow adjust becomes zero for group'''
         
-        adjust = -self.total_charge(group)/cnt if group else -self.total_charge()/cnt
+        adjust = -self.total_charge(group)/cnt
         for x in types:
             for y in self.ff.nonbond_types:
                 if x == y['type']:
