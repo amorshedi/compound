@@ -516,7 +516,6 @@ class Compound(object):
 
         """
         # Preprocessing and validating input type
-        from port import Port
         if not hasattr(objs_to_remove, '__iter__'):
             objs_to_remove = [objs_to_remove]
         objs_to_remove = set(objs_to_remove)
@@ -2667,7 +2666,6 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             between the two anchor atoms.
 
         """
-        from port import Port
         if flip==1:
             from_positions.xyz_with_ports = self.reflect(from_positions.xyz_with_ports,
                                                          from_positions.center(1),from_positions.orientation)
