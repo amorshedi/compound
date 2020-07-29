@@ -2968,12 +2968,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
                 elif unit_style == 'lj':
                     atom_line ='{index:d}\t{zero:d}\t{type_index:d}\t{charge:.4e}\t{x:.6f}\t{y:.6f}\t{z:.6f}\n'
 
-
-            # atom_names = OrderedSet([atom.name for atom in self.particles(0)])
             nlst = self.particles_label_sorted()
-            # graph = nx.Graph()
-            # graph.add_nodes_from(nlst)
-            # graph.add_edges_from(self.bond_graph.edges)
             comps = list(nx.connected_components(self.bond_graph))
 
             for i,p in enumerate(nlst,1):

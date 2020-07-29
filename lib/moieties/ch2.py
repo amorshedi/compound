@@ -1,5 +1,4 @@
-from compound import Compound,compload
-from port import Port
+from compound import Compound,compload, Port
 
 def CH2():
 
