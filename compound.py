@@ -1,9 +1,9 @@
 import numpy as np
 from collections import OrderedDict, defaultdict, Iterable
 from copy import deepcopy
-import os, sys, tempfile, importlib, itertools
+import os, sys, tempfile, importlib
 from warnings import warn
-from itertools import chain
+from itertools import chain, compress
 import mdtraj as md
 from mdtraj.core.element import get_by_symbol
 from oset import oset as OrderedSet
@@ -14,7 +14,6 @@ from os import system as syst
 
 from openbabel import openbabel as ob
 # from openbabel import pybel as pb
-from itertools import compress as cmp
 from pymatgen.util.coord import pbc_shortest_vectors, get_angle
 from pymatgen.core import Structure
 from itertools import combinations
@@ -24,7 +23,7 @@ from pymatgen import Lattice, Structure
 # from openbabel import pybel
 
 from numpy.linalg import inv, norm, det
-from coordinate_transform import _translate, _rotate,AxisTransform,RigidTransform
+from coordinate_transform import _translate, _rotate,AxisTransform,RigidTransform, unit_vector, angle
 from foyer.forcefield import Forcefield
 from collections import defaultdict
 from foyer.smarts_graph import SMARTSGraph
@@ -764,7 +763,7 @@ class Compound(object):
         if not self.children:
             pos = np.expand_dims(self._pos, axis=0)
         else:
-            arr = np.fromiter(itertools.chain.from_iterable(
+            arr = np.fromiter(chain.from_iterable(
                 particle.pos for particle in self.particles(0)), dtype=float)
             pos = arr.reshape((-1, 3))
         return pos
@@ -854,9 +853,9 @@ class Compound(object):
         xyz = self.xyz
         return Box(mins=xyz.min(axis=0), maxs=xyz.max(axis=0))
 
-    def vmd(self,ports=1,atoms=[]):
+    def vmd(self,ports=1,atoms=[],label_sorted=1):
         """ see the system in vmd """
-        self.write_lammpstrj(ports=ports)
+        self.write_lammpstrj(ports=ports,label_sorted=label_sorted)
         os.system('>txt;# echo "mol new {out.lammpstrj} type {lammpstrj} first 0 last -1 step 1 waitfor -1" >> txt')
         if atoms:
             idx = np.in1d(self.particles_label_sorted(),atoms)
@@ -867,7 +866,7 @@ class Compound(object):
         os.system('vmd out.lammpstrj -e txt')
         os.system('rm out.lammpstrj txt')
 
-    def write_lammpstrj(self, unit_set='real',ports=1):
+    def write_lammpstrj(self, fle='out', unit_set='real',ports=1, label_sorted=1):
         """Write one or more frames of data to a lammpstrj file.
 
         Parameters
@@ -877,7 +876,7 @@ class Compound(object):
             http://lammps.sandia.gov/doc/units.html for options. Currently supported
             unit sets: 'real'.
         """
-        fle=open('out.lammpstrj','w')
+        fle=open(fle+'.lammpstrj','w')
         fle.write('''ITEM: TIMESTEP
 0
 ITEM: NUMBER OF ATOMS
@@ -890,7 +889,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         fle.write('{0} {1} {2}\n\n'.format(self.box.zlo_bound, self.box.zhi_bound, self.box.yz))
         # --- begin body ---
         fle.write('ITEM: ATOMS element x y z\n')
-        for part in self.particles_label_sorted(ports):
+        for part in self.particles_label_sorted(ports) if label_sorted else self.particles(ports):
             fle.write('{} {} {} {}\n'.format(part.name,*part.pos.tolist()))
 
 
@@ -979,7 +978,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
 
     def neighbs(self,set1,set2=None,rcut=2,slf=0):
         ''' set1: either a list of atoms or a list of coordinates'''
-        set1, set2 = list(set1), list(set2)
+        set1, set2 = [set1] if isinstance(set1, Compound) else list(set1), list(set2)
         if not set2:
             set2 = self.particles()
 
@@ -992,11 +991,9 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             r = (coord - coords_set2) @ inv(self.latmat)
             rfrac = r - np.round(r)
             dists = norm(rfrac @ self.latmat,axis=1)
-            if slf==0 and coord in coords_set2:
-                dists[cnt]=np.inf
 
-            tmp = np.where(dists<rcut)[0]
-            idx[cnt].extend([set2[x] for x in tmp])
+            tmp = dists<rcut
+            idx[cnt].extend([x for x in compress(set2, tmp) if slf or set1[cnt]!=x])
             odists.append(dists[tmp])
 
         return idx,odists
@@ -1034,13 +1031,6 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         for particle in self.particles(0):
             particle.pos += (np.random.rand(3,) - 0.5) / 100
         self._update_port_locations(xyz_init)
-
-    warning_message = 'Please use Compound.energy_minimize()'
-    # from utils.decorators import deprecated
-
-    # @deprecated(warning_message)
-    def energy_minimization(self, forcefield='UFF', steps=1000, **kwargs):
-        self.energy_minimize(forcefield=forcefield, steps=steps, **kwargs)
 
     def energy_minimize(self, forcefield='UFF', steps=1000, **kwargs):
         """Perform an energy minimization on a Compound
@@ -1628,6 +1618,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             The vector about which to rotate the Compound.
 
         """
+
         new_positions = _rotate(self.xyz_with_ports, theta, around)
         self.xyz_with_ports = new_positions
 
@@ -1710,7 +1701,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
                 else:
                     parent_cmpd = chain_compound
                 for atom in res.atoms:
-                    new_atom = Particle(name=str(atom.name),
+                    new_atom = Compound(name=str(atom.name),
                                         pos=traj.xyz[frame, atom.index])
                     parent_cmpd.add(new_atom)
                     atom_mapping[atom] = new_atom
@@ -2684,14 +2675,16 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         move_this.xyz_with_ports = T.apply_to(move_this.xyz_with_ports)
 
         if add_bond:
-            if isinstance(from_positions, Port) and isinstance(to_positions, Port):
-                if not from_positions.anchor or not to_positions.anchor:
-                    warn("Attempting to form bond from port that has no anchor")
-                else:
-                    from_positions.anchor.parent.add_bond((from_positions.anchor, to_positions.anchor))
-                    to_positions.anchor.parent.add_bond((from_positions.anchor, to_positions.anchor))
-                    from_positions.anchor.parent.remove(from_positions)
-                    to_positions.anchor.parent.remove(to_positions)
+            if not from_positions.anchor or not to_positions.anchor:
+                warn("Attempting to form bond from port that has no anchor")
+            else:
+                from_positions.anchor.root.add_bond((from_positions.anchor, to_positions.anchor))
+                to_positions.anchor.root.add_bond((from_positions.anchor, to_positions.anchor))
+                from_positions.anchor.parent.remove(from_positions)
+                to_positions.anchor.parent.remove(to_positions)
+        elif from_positions.port_particle and to_positions.port_particle:
+            from_positions.parent.remove(from_positions)
+            to_positions.parent.remove(to_positions)
 
     def _create_equivalence_transform(self,equiv):
         """Compute an equivalence transformation that transforms this compound
@@ -3201,7 +3194,7 @@ end structure
 
             for i in range(m_compound):
                 coords = tmp.xyz[i*comp.n_particles():(i+1)*comp.n_particles()]
-                _,out = self.neighbs(coords,initself.particles(), rcut=2)
+                _,out = self.neighbs(coords,initself.particles(), rcut=1.5)
                 # p=[x for x in p[0] if x not in tmp.particles()[i*comp.n_particles():(i+1)*comp.n_particles()]]
 
                 if not list(chain.from_iterable(out)):
@@ -3448,4 +3441,49 @@ class Box:
 
     zlo_bound, zhi_bound = zlo, zhi
 
-Particle = Compound
+class Port(Compound):
+    """A set of four ghost Particles used to connect parts.
+
+    Parameters
+    ----------
+    anchor : mb.Particle, optional, default=None
+        A Particle associated with the port. Used to form bonds.
+    orientation : array-like, shape=(3,), optional, default=[0, 1, 0]
+        Vector along which to orient the port
+    separation : float, optional, default=0
+        Distance to shift port along the orientation vector from the anchor
+        particle position. If no anchor is provided, the port will be shifted
+        from the origin.
+    anchor : mb.Particle, optional, default=None
+        A Particle associated with the port. Used to form bonds.
+    type: up or down: decide whether to flip
+
+    """
+    def __init__(self, anchor=[0,0,0], orientation=[0, 1, 0], loc_vec=[0, 0, 1],
+                 separation=None,type='up',name='port'):
+        super(Port, self).__init__(name=name)
+        self.port_particle = 1
+        default_orientation = [0, 1, 0]
+        if isinstance(anchor, Compound):
+            self.anchor = anchor
+            anchor = anchor.pos
+
+        orientation, loc_vec = map(np.asarray, [orientation, loc_vec])
+
+        coords = [[0.05, 0.025, -0.025],
+                  [0.05, 0.225, -0.025],
+                  [-0.15, -0.075, -0.025],
+                  [0.05, -0.175, 0.075]]
+
+        for x in coords:
+            self.add(Compound(name='_p',pos=x))
+        # rotate the ports to get proper orientation
+        normal = np.cross(default_orientation, orientation)
+        self.rotate(angle(default_orientation, orientation), normal)
+
+        self.translate_to(anchor+separation*unit_vector(loc_vec) if separation != None
+                              else anchor+loc_vec)
+
+        if type is not 'up':
+            self.xyz_with_ports = self.reflect(self.xyz_with_ports,np.zeros(3),orientation)
+        self.orientation = orientation
