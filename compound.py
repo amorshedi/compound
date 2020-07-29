@@ -2986,7 +2986,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
                                f"{bidx[0]}\t{bidx[1]}\n")
 
                 # Angle data
-                if self.ff.angle_types:
+                if self.ff.angle_types and self.angles_typed:
                     data.write('\nAngles\n\n')
                     for i, angle in enumerate(self.angles_typed.items(), 1):
                         aidx=[nlst.index(j)+1 for j in angle[0]]
@@ -2994,7 +2994,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
                                    f"{aidx[0]}\t{aidx[1]}\t{aidx[2]}\n")
 
                 # Dihedral data
-                if self.ff.proper_types:
+                if self.ff.proper_types and self.propers_typed:
                     data.write('\nDihedrals\n\n')
                     for i,prop in enumerate(self.propers_typed.items(),1):
                         pidx=[nlst.index(j)+1 for j in prop[0]]
