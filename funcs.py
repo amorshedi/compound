@@ -1,8 +1,101 @@
 import numpy as np
 import os, re, subprocess, math, io
 from lammps import PyLammps, lammps
-from numpy.linalg import norm
+from numpy.linalg import norm, svd
 from math import degrees, radians
+from collections.abc import Iterable
+# from lib.recipes.alkane import Alkane
+# from compound import Compound, compload, Port
+from copy import deepcopy
+
+def flatten(l):
+    for el in l:
+        if isinstance(el, Iterable) and not isinstance(el, (str, bytes)):
+            yield from flatten(el)
+        else:
+            yield el
+
+def pairs_in_rcut(compound, pairs, rcut):
+    tmp = set()
+    tpairs = []
+    for p in pairs:
+        _, dist = compound.neighbs([p[0]], [p[1]], rcut=3.6)
+        if dist and not [x for x in p if x in tmp]:
+            tpairs.append(p)
+            [tmp.add(x) for x in p]
+    return tpairs
+
+def transform_mat(A, B):
+    ''' two sets of 3D points, gives the matrix that rigid transforms one into the other.
+     for details see http://nghiaho.com/?page_id=671'''
+    A, B = map(np.array, [A, B])
+
+    centroid_A = np.mean(A, axis=0)
+    centroid_B = np.mean(B, axis=0)
+    centroid_A.shape = (1, 3)
+    centroid_B.shape = (1, 3)
+
+    H = np.zeros((3, 3), dtype=float)
+    for i in range(A.shape[0]):
+        H = H + (A[i, :] - centroid_A).reshape(3,1) @ (B[i, :] - centroid_B)
+    U, _, V = svd(H)
+    R = np.transpose(U @ V)
+
+    t = (centroid_B.reshape(3,1) - R @ centroid_A.reshape(3,1))
+    return np.vstack([np.hstack([R, t]), [0, 0, 0, 1]])
+
+def apply_transform(T, points):
+    points = np.array(points)
+    one_row = np.ones([1,points.shape[0]])
+    return (T @ np.vstack([points.T, one_row]))[0:3,:].T
+
+
+def alkane(n):
+    from compound import Compound, Port
+    ch2 = Compound(name='ch2')
+    ch2.add(Compound(name='C',pos=[0,0.5935,0]))
+    ch2.add(Compound(name='H',pos=[0,1.2513,0.8857]))
+    ch2.add(Compound(name='H',pos=[ 0,1.2513,-0.8857]))
+
+    dr1, dr2 = [-0.64315, -0.42845, 0], [ 0.64315, -0.42845, 0]
+    ch2.add(Port(anchor=ch2['C'], loc_vec=dr1),expand=0)
+    ch2.add(Port(anchor=ch2['C'], loc_vec=dr2),expand=0)
+    [ch2.add_bond(x) for x in [[ch2[0], ch2[1]],[ch2[0], ch2[2]]]]
+    alk = Compound(name='alkane')
+    alk.add(ch2)
+    for i in range(n-1):
+        c_ch2 = deepcopy(ch2)
+        alk.add(c_ch2)
+        alk.force_overlap(c_ch2, c_ch2[-2], alk[-6], flip=1)
+
+    return alk
+
+def dimer(nchain):
+    from compound import Compound, compload, Port
+    from funcs import alkane
+    alksil = Compound(name='alksil')
+
+    sil = compload('/home/ali/ongoing_research/polymer4/22_lammps_py_fitting/sil.mol2', compound=Compound(name='sil'),
+                   infer_hierarchy=0)  # type: Compound
+    c1, c2 = [6.3001, 4.1639, 6.0570], [8.5253, 8.0180, 6.0570]
+
+    tmp1, tmp2 = c1 - sil['Si1'].pos, c2 - sil['Si2'].pos
+    sil.add(Port(sil['Si1'], loc_vec=tmp1, orientation=[0, 0, 1], name='c1'), expand=0)
+    sil.add(Port(sil['Si2'], loc_vec=tmp2, orientation=[0, 0, 1], name='c2'), expand=0)
+
+    alksil.add(sil, expand=0)
+    alkane = alkane(nchain)
+    alkane['port'][0].translate_to(alkane['C'][0].pos)  # translate port to carbon
+    alkane['port'][0].rotate(-90, [0, 0, 1])
+    # alkane.energy_minimize()
+
+    alksil.add(deepcopy(alkane), expand=0)
+    alksil.add(alkane, expand=0)
+
+    alksil.force_overlap(alksil['alkane'][0], alksil['alkane'][0]['port'][0], sil['c1'], flip=1)
+    alksil.force_overlap(alksil['alkane'][1], alksil['alkane'][1]['port'][0], sil['c2'], flip=1)
+    alksil.remove([x.parent for x in alksil.particles_by_name('_p')])
+    return alksil
 
 def mod_com(commands, intervals, tt, opts, pstr: 'partial string', par_lst, par_lst2):
     a, b = [eval(str(tt['f'+x])) for x in opts[:2]]
@@ -60,7 +153,7 @@ def get_file_num(outdir):
     except:
 	    return 1
 
-def coords_forces_from_outcar(direc, nump):
+def coords_forces_from_outcar(direc, nump,save_npy=0):
     '''direc: outcar directory
        nump: number of particles'''
 

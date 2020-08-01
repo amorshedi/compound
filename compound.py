@@ -9,7 +9,7 @@ from mdtraj.core.element import get_by_symbol
 from oset import oset as OrderedSet
 import parmed as pmd
 from parmed.periodic_table import AtomicNum, element_by_name, Mass, Element
-
+from funcs import *
 from os import system as syst
 
 from openbabel import openbabel as ob
@@ -29,7 +29,6 @@ from collections import defaultdict
 from foyer.smarts_graph import SMARTSGraph
 from networkx.algorithms import isomorphism
 import networkx as nx
-from funcs import *
 from orderedset import OrderedSet
 
 #to do list:
@@ -520,105 +519,16 @@ class Compound(object):
             objs_to_remove = [objs_to_remove]
         objs_to_remove = set(objs_to_remove)
 
-        # If nothing is to be remove, do nothing
-        if len(objs_to_remove) == 0:
-            return
-
-        # # Remove Port objects separately
-        # ports_removed = set()
-        # for obj in objs_to_remove:
-        #     if isinstance(obj, Port):
-        #         ports_removed.add(obj)
-        #         self._remove(obj)
-        #         obj.parent.children.remove(obj)
-        #         self._remove_references(obj)
-
-        # objs_to_remove = objs_to_remove - ports_removed
-
-        # Get particles to remove
-        particles_to_remove = set([particle for obj in objs_to_remove
-                                            for particle in obj.particles(1)])
-
-        # Recursively get container compounds to remove
-        to_remove = list()
-
-        def _check_if_empty(child):
-            if child in to_remove:
-                return
-            if set(child.particles(1)).issubset(particles_to_remove):
-                if child.parent:
-                    to_remove.append(child)
-                    _check_if_empty(child.parent)
-                # else:
-                #     warn("This will remove all particles in "
-                #             "compound {}".format(self))
-            return
-
-        for particle in particles_to_remove:
-            _check_if_empty(particle)
-
-        # Fix rigid_ids and remove obj from bondgraph
-        for removed_part in to_remove:
-            self._remove(removed_part)
-
-        # Remove references to object
-        for removed_part in to_remove:
-            if removed_part.parent is not None:
-                removed_part.parent.children.remove(removed_part)
-            # self._remove_references(removed_part)
-
-        # # Remove ghost ports
-        # all_ports_list = list(self.all_ports())
-        # for port in all_ports_list:
-        #     if port.anchor not in [i for i in self.particles()]:
-        #         port.parent.children.remove(port)
-
-        # # Check and reorder rigid id
-        # for _ in particles_to_remove:
-        #     if self.contains_rigid:
-        #         self.root._reorder_rigid_ids()
-
-
-    def _remove(self, removed_part):
-        """Worker for remove(). Fixes rigid IDs and removes bonds"""
-
-        if self.root.bond_graph and self.root.bond_graph.has_node(
-                removed_part):
-            # for neighbor in self.root.bond_graph.neighbors(removed_part):
-            #     self.root.remove_bond((removed_part, neighbor))
-            self.root.bond_graph.remove_node(removed_part)
-
-
-    # def _remove_references(self, removed_part):
-    #     """Remove labels pointing to this part and vice versa. """
-    #     removed_part.parent = None
-    #
-    #     # Remove labels in the hierarchy pointing to this part.
-    #     referrers_to_remove = set()
-    #     for referrer in removed_part.referrers:
-    #         if removed_part not in referrer.ancestors():
-    #             for label, referred_part in list(referrer.labels.items()):
-    #                 if referred_part is removed_part:
-    #                     del referrer.labels[label]
-    #                     referrers_to_remove.add(referrer)
-    #     removed_part.referrers -= referrers_to_remove
-    #
-    #     # Remove labels in this part pointing into the hierarchy.
-    #     labels_to_delete = []
-    #     if isinstance(removed_part, Compound):
-    #         for label, part in list(removed_part.labels.items()):
-    #             if not isinstance(part, Compound):
-    #                 for p in part:
-    #                     self._remove_references(p)
-    #             elif removed_part not in part.ancestors():
-    #                 try:
-    #                     part.referrers.discard(removed_part)
-    #                 except KeyError:
-    #                     pass
-    #                 else:
-    #                     labels_to_delete.append(label)
-    #     for label in labels_to_delete:
-    #         removed_part.labels.pop(label, None)
+        for obj in objs_to_remove:
+            if self.root.bond_graph: #take care of removing bonds
+                for p in obj.particles(0):
+                    if self.root.bond_graph.has_node(p):
+                        self.root.bond_graph.remove_node(p)
+            if obj in self.children:
+                self.children.remove(obj)
+            else:
+                for obj2 in self.children:
+                    obj2.remove(obj)
 
     def referenced_ports(self):
         """Return all Ports referenced by this Compound.
@@ -642,7 +552,6 @@ class Compound(object):
             A list of all Ports referenced by this Compound and its successors
 
         """
-        from port import Port
         return [successor for successor in self.successors()
                 if isinstance(successor, Port)]
 
@@ -780,7 +689,6 @@ class Compound(object):
         for i, p in enumerate(self.particles_label_sorted(0)):
             p._pos = value[i]
 
-
     @property
     def xyz_with_ports(self):
         """Return all particle coordinates in this compound including ports.
@@ -838,19 +746,6 @@ class Compound(object):
                 return np.mean(self.xyz_with_ports, axis=0)
             else:
                 return np.mean(self.xyz, axis=0)
-
-    @property
-    def boundingbox(self):
-        """Compute the bounding box of the compound.
-
-        Returns
-        -------
-        mb.Box
-            The bounding box for this Compound
-
-        """
-        xyz = self.xyz
-        return Box(mins=xyz.min(axis=0), maxs=xyz.max(axis=0))
 
     def vmd(self,ports=1,atoms=[],label_sorted=1):
         """ see the system in vmd """
@@ -1606,7 +1501,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         """
         self.translate(pos - self.center(1))
 
-    def rotate(self, theta, around):
+    def rotate(self, theta, around, degrees = 1):
         """Rotate Compound around an arbitrary vector.
 
         Parameters
@@ -1617,9 +1512,11 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             The vector about which to rotate the Compound.
 
         """
-
-        new_positions = _rotate(self.xyz_with_ports, theta, around)
-        self.xyz_with_ports = new_positions
+        import math
+        if degrees:
+            theta = math.radians(theta)
+        new_positions = _rotate(self.xyz_with_ports-self.center(1), theta, around)
+        self.xyz_with_ports = new_positions+self.center(1)
 
     def spin(self, theta, around):
         """Rotate Compound in place around an arbitrary vector.
@@ -2669,8 +2566,9 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         if flip==1:
             from_positions.xyz_with_ports = self.reflect(from_positions.xyz_with_ports,
                                                          from_positions.center(1),from_positions.orientation)
-        T = RigidTransform(from_positions.xyz_with_ports, to_positions.xyz_with_ports)
-        move_this.xyz_with_ports = T.apply_to(move_this.xyz_with_ports)
+        T = transform_mat(from_positions.xyz_with_ports, to_positions.xyz_with_ports)
+        move_this.xyz_with_ports = apply_transform(T, move_this.xyz_with_ports)
+        # T = RigidTransform(from_positions.xyz_with_ports, to_positions.xyz_with_ports)
 
         if add_bond:
             if not from_positions.anchor or not to_positions.anchor:
@@ -3271,7 +3169,6 @@ end structure
                    y['charge'] = str(float(y['charge']) + adjust)
 
     def write_gulp(self, direc):
-        from funcs import equivalence_classes
 
         types = equivalence_classes(self.ff.atom_types, lambda x,y: x['element']==y['element'])
         
@@ -3462,6 +3359,7 @@ class Port(Compound):
             anchor = anchor.pos
 
         orientation, loc_vec = map(np.asarray, [orientation, loc_vec])
+        orientation = orientation/norm(orientation)
 
         coords = [[0.05, 0.025, -0.025],
                   [0.05, 0.225, -0.025],
@@ -3472,7 +3370,7 @@ class Port(Compound):
             self.add(Compound(name='_p',pos=x))
         # rotate the ports to get proper orientation
         normal = np.cross(default_orientation, orientation)
-        self.rotate(angle(default_orientation, orientation), normal)
+        self.rotate(angle(default_orientation, orientation), normal, degrees=0)
 
         self.translate_to(anchor+separation*unit_vector(loc_vec) if separation != None
                               else anchor+loc_vec)

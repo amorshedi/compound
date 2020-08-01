@@ -349,7 +349,7 @@ def _rotate(coordinates, theta, around):
 
 warning_message = 'Please use Compound.rotate()'
 @deprecated(warning_message)
-def rotate(compound, theta, around):
+def rotate(compound, theta, around, degrees=1):
     """Rotate a compound around an arbitrary vector.
 
     Parameters
@@ -357,11 +357,12 @@ def rotate(compound, theta, around):
     compound : mb.Compound
         The compound being rotated.
     theta : float
-        The angle by which to rotate the compound, in radians.
+        The angle by which to rotate the compound, in degrees.
     around : np.ndarray, shape=(3,), dtype=float
         The vector about which to rotate the compound.
 
     """
+
     around = np.asarray(around).reshape(3)
     if np.array_equal(around, np.zeros(3)):
         raise ValueError('Cannot rotate around a zero vector')
