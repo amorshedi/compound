@@ -180,6 +180,7 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
         compound.label_rigid_bodies()
     return compound
 
+
 def clone(existing_compound, clone_of=None, root_container=None):
     """A faster alternative to deepcopying.
 
@@ -219,71 +220,26 @@ class Compound(object):
     the composite, and Particle playing the role of the primitive (leaf) part,
     where Particle is in fact simply an alias to the Compound class.
 
-    Compound maintains a list of children (other Compounds contained within),
-    and provides a means to tag the children with labels, so that the compounds
-    can be easily looked up later. Labels may also point to objects outside the
-    Compound's containment hierarchy. Compound has built-in support for copying
+    Compound maintains a list of children (other Compounds contained within).
+    Compound has built-in support for copying
     and deepcopying Compound hierarchies, enumerating particles or bonds in the
     hierarchy, proximity based searches, visualization, I/O operations, and a
     number of other convenience methods.
 
     Parameters
     ----------
-    subcompounds : mb.Compound or list of mb.Compound, optional, default=None
-        One or more compounds to be added to self.
     name : str, optional, default=self.__class__.__name__
         The type of Compound.
     pos : np.ndarray, shape=(3,), dtype=float, optional, default=[0, 0, 0]
         The position of the Compound in Cartestian space
-    charge : float, optional, default=0.0
-        Currently not used. Likely removed in next release.
-    periodicity : np.ndarray, shape=(3,), dtype=float, optional, default=[0, 0, 0]
-        The periodic lengths of the Compound in the x, y and z directions.
-        Defaults to zeros which is treated as non-periodic.
-    port_particle : bool, optional, default=False
-        Whether or not this Compound is part of a Port
-
-    Attributes
-    ----------
-    bond_graph : mb.BondGraph
-        Graph-like object that stores bond information for this Compound
-    children : OrderedSet
-        Contains all children (other Compounds).
-    labels : OrderedDict
-        Labels to Compound/Atom mappings. These do not necessarily need not be
-        in self.children.
-    parent : mb.Compound
-        The parent Compound that contains this part. Can be None if this
-        compound is the root of the containment hierarchy.
-    referrers : set
-        Other compounds that reference this part with labels.
-    rigid_id : int, default=None
-        The ID of the rigid body that this Compound belongs to.  Only Particles
-        (the bottom of the containment hierarchy) can have integer values for
-        `rigid_id`. Compounds containing rigid particles will always have
-        `rigid_id == None`. See also `contains_rigid`.
-    boundingbox
-    center
-    contains_rigid
-    max_rigid_id
-    n_particles
-    n_bonds
-    root
-    xyz
-    xyz_with_ports
-
     """
 
-    def __init__(self, subcompounds=None, name=None, pos=None):
-        # super(Compound, self).__init__()
+    def __init__(self, name='comp', names=None, pos=None):
 
-        if name:
-            self.name = name
-        else:
-            self.name = self.__class__.__name__
-
-        if pos is not None:
-            self._pos = np.asarray(pos, dtype=float)
+        self.name = name
+        
+        if pos is not None and (pos.ndim == 1 or pos.shape[0] == 1):
+            self._pos = pos.flatten()
         else:
             self._pos = np.zeros(3)
 
@@ -295,13 +251,28 @@ class Compound(object):
 
         self.bond_graph = None
 
-        # self.add() must be called after labels and children are initialized.
-        if subcompounds:
-            self.add(subcompounds)
-
-        self.latmat = np.eye(3)
+        self._latmat = np.eye(3)
         self.box = Box(self)
-
+        
+        if names:
+            for x, y in zip(names, pos):
+                self.add(Compound(name=x, pos=y))
+            
+    
+    @property
+    def latmat(self):
+        return self._latmat
+    
+    @latmat.setter
+    def latmat(self, vec):
+        tmp = np.array(vec).flatten()
+        if tmp.size == 1:
+            self._latmat = tmp * np.eye(3)
+        elif tmp.size == 3:
+            self._latmat = np.diag(tmp)
+        else:
+            self._latmat = vec
+        
     @staticmethod
     def reflect(p, pp, pvec):
         """ image of a point with respect to a plane
@@ -582,39 +553,25 @@ class Compound(object):
 
         self.root.bond_graph.add_edge(particle_pair[0], particle_pair[1])
 
-    def generate_bonds(self, name_a, name_b, dmin, dmax):
+    def generate_bonds(self, atoms_a, atoms_b, dmin, dmax):
         """Add Bonds between all pairs of types a/b within [dmin, dmax].
 
         Parameters
         ----------
-        name_a : str
-            The name of one of the Particles to be in each bond
-        name_b : str
-            The name of the other Particle to be in each bond
         dmin : float
             The minimum distance between Particles for considering a bond
         dmax : float
             The maximum distance between Particles for considering a bond
 
         """
-        particle_kdtree = PeriodicCKDTree(
-            data=self.xyz, bounds=self.periodicity)
-        particle_array = np.array(list(self.particles()))
-        added_bonds = list()
-        for p1 in self.particles_by_name(name_a):
-            nearest = self.particles_in_range(p1, dmax, max_particles=20,
-                                              particle_kdtree=particle_kdtree,
-                                              particle_array=particle_array)
-            for p2 in nearest:
-                if p2 == p1:
-                    continue
-                bond_tuple = (p1, p2) if id(p1) < id(p2) else (p2, p1)
-                if bond_tuple in added_bonds:
-                    continue
-                min_dist = self.min_periodic_distance(p2.pos, p1.pos)
-                if (p2.name == name_b) and (dmin <= min_dist <= dmax):
-                    self.add_bond((p1, p2))
-                    added_bonds.append(bond_tuple)
+        atoms_a, atoms_b = map(list, [atoms_a, atoms_b])
+        neighbs, dists = self.neighbs(atoms_a, atoms_b, rcut=dmax)
+
+        for i, p in enumerate(atoms_a):
+            for x, d in zip(neighbs[i], dists[i]):
+                if d > dmin:
+                    self.add_bond([p, x])
+
 
     def remove_bond(self, particle_pair):
         """Deletes a bond between a pair of Particles
@@ -747,18 +704,44 @@ class Compound(object):
             else:
                 return np.mean(self.xyz, axis=0)
 
-    def vmd(self,ports=1,atoms=[],label_sorted=1):
+    def lmps_minimize(self, fixed_atoms=None, movie_freq=100):
+        fixed_atoms = list(fixed_atoms)
+        self.write_lammpsdata('data.dat')
+        lmps,_ = get_lmps(np.array([self.xyz_label_sorted]))
+        commands = []
+        if fixed_atoms:
+            commands.append('group fixed id '+' '.join([str(self.particles_label_sorted().index(x)+1) for x in fixed_atoms]))
+            commands.append('fix fx fixed setforce 0 0 0 ')
+        commands.extend([f'dump 10 all custom {movie_freq} movie.lammpstrj element x y z',
+                            'dump_modify 10 element ' +' '.join([x['name'] for x in self.ff.atom_types]),
+                            'minimize 1e-8 1e-8 10000 100000'])
+        lmps.commands_list(commands)
+        os.remove('log.lammps')
+        return np.ctypeslib.as_array(lmps.extract_atom("x", 3).contents, shape=self.xyz.shape)
+
+
+    def vmd(self,ports=1,atoms=[],label_sorted=1, mol2=0):
         """ see the system in vmd """
-        self.write_lammpstrj(ports=ports,label_sorted=label_sorted)
+
         os.system('>txt;# echo "mol new {out.lammpstrj} type {lammpstrj} first 0 last -1 step 1 waitfor -1" >> txt')
         if atoms:
+            if not hasattr(atoms, '__iter__'):
+                atoms = [atoms]
+            else:
+                atoms = list(atoms)
             idx = np.in1d(self.particles_label_sorted(),atoms)
             os.system('echo "mol addrep 0" >>txt')
             os.system('echo "mol modstyle 1 0 VDW 0.3 30." >>txt')
             os.system('echo "mol modselect 1 0 index '+(np.sum(idx)*'{} ').format(*np.nonzero(idx)[0])+'" >>txt')
 
-        os.system('vmd out.lammpstrj -e txt')
-        os.system('rm out.lammpstrj txt')
+        if mol2:
+            self.save('out.mol2')
+            os.system('vmd out.mol2 -e txt')
+            os.system('rm out.mol2 txt')
+        else:
+            self.write_lammpstrj(ports=ports,label_sorted=label_sorted)
+            os.system('vmd out.lammpstrj -e txt')
+            os.system('rm out.lammpstrj txt')
 
     def write_lammpstrj(self, fle='out', unit_set='real',ports=1, label_sorted=1):
         """Write one or more frames of data to a lammpstrj file.
@@ -787,14 +770,13 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             fle.write('{} {} {} {}\n'.format(part.name,*part.pos.tolist()))
 
 
-    def write_poscar(self, filename='POSCAR', lattice_const = 1, sel_dev=False,coord='cartesian'):
+    def write_poscar(self, path='.', lattice_const = 1,
+                     fixed_atoms=[],coord='cartesian'):
         """
         Parameters
         ----------
         filename: str
             Path of the output file
-        sel_dev: boolean, default=False
-            Turns selective dynamics on.  Not currently implemented.
         coord: str, default = 'cartesian', other option = 'direct'
             Coordinate style of atom positions
         """
@@ -807,8 +789,8 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
                 atom.xz = atom.xz / lattice_constant
 
 
-        with open(filename, 'w') as data:
-            data.write(filename+f' - created by mBuild\n'
+        with open(os.path.join(path, 'POSCAR'), 'w') as data:
+            data.write(f' - created by mBuild\n'
                                 f'{lattice_const}\n')
             for x in self.latmat:
                 data.write(f'{x[0]} {x[1]} {x[2]} \n')
@@ -816,14 +798,16 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             part_names = [x.name for x in self.particles(0)]
             data.write((len(atom_names)*'{} ').format(*[part_names.count(y) for y in atom_names])+'\n')
 
-            if sel_dev:
+            if fixed_atoms:
                 data.write('Selective Dyn\n')
             data.write(coord+'\n')
 
-            for label in atom_names:
-                for coord in [x.pos for x in self.particles(0) if x.name == label]:
-                    data.write('{0:.13f} {1:.13f} {2:.13f}\n'.format(*coord))
-
+            for p in self.particles_label_sorted():
+                data.write('{0:.13f} {1:.13f} {2:.13f} '.format(*p.pos))
+                if fixed_atoms:
+                    data.write(' '.join(3*['F' if p in fixed_atoms else 'T'])+'\n')
+                else:
+                    data.write('\n')
 
     def particles_in_range(
             self,
@@ -872,7 +856,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
 
     def neighbs(self,set1,set2=None,rcut=2,slf=0):
         ''' set1: either a list of atoms or a list of coordinates'''
-        set1, set2 = [set1] if isinstance(set1, Compound) else list(set1), list(set2)
+        set1, set2 = [set1] if isinstance(set1, Compound) else list(set1), list(set2) if set2 else self.particles()
         if not set2:
             set2 = self.particles()
 
@@ -880,15 +864,19 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         coords_set2 = np.vstack([x.xyz for x in set2]) if set2 else self.xyz  #self.xyz[[x in set2 for x in self.particles()]]
 
         idx = [[] for i in range(set1.__len__())]
-        odists = []
+        odists = deepcopy(idx)
         for cnt,coord in enumerate(coords_set1):
             r = (coord - coords_set2) @ inv(self.latmat)
             rfrac = r - np.round(r)
             dists = norm(rfrac @ self.latmat,axis=1)
 
             tmp = dists<rcut
-            idx[cnt].extend([x for x in compress(set2, tmp) if slf or set1[cnt]!=x])
-            odists.append(dists[tmp])
+            for x, y in zip(compress(set2, tmp), compress(dists, tmp)):
+                if slf or set1[cnt] != x:
+                    idx[cnt].append(x)
+                    odists[cnt].append(y)
+            # [x for x in  if slf or set1[cnt]!=x])
+            # odists.extend([dists[i] for i, x in enumerate(compress(set2, tmp)) ])
 
         return idx,odists
 
@@ -1439,9 +1427,6 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         except KeyError:
             saver = None
 
-        if os.path.exists(filename) and not overwrite:
-            raise IOError('{0} exists; not overwriting'.format(filename))
-
         structure = self.to_parmed(residues=residues,
                                    show_ports=show_ports)
         # Apply a force field with foyer if specified
@@ -1479,7 +1464,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             output_sdf.close()
 
         else:  # ParmEd supported saver.
-            structure.save(filename, overwrite=overwrite, **kwargs)
+            structure.save(filename, overwrite=1, **kwargs)
 
     def translate(self, by):
         """Translate the Compound by a vector
@@ -1827,6 +1812,10 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             self.add_bond((atom1, atom2))
 
         self.latmat=np.array(structure.box_vectors._value)
+
+    # def from_ase(self, atoms_obj):
+        
+
 
     @property
     def frac_coords(self):
@@ -3205,57 +3194,6 @@ end structure
             for x in self.ff.atom_types:
                 f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]}  {2*float(x['k'])}  {x['angle']}\n")
 
-#           "  Oh      Sb     H        100        115"
-#         "  Ob      Si      Si      340        144"
-#         "  Ob      Si      Sb      340        139"
-#         "  Si      Oc      Oc      340        112.5"
-#         "  Si      Oc      Ob      340        111.5"
-#         "  Si      Ob      Ob      340        100.2"
-#         "  Sb     Oh      Oh       340        113"
-#         "  Sb     Oh      Ob       340        111"
-#         "  Sb     Ob      Ob       340        107"
-#         "  Ow      Hw      Hw      100        104.5"
-#         "  Sb     Oh      Od       340        111.5"
-#         "  Sb     Od      Od       340        111.5"
-#         "  Sb     Od      Ob       340        107.4"
-#         "  Sb     Ob      C        88.2       117.3"
-#         "  Sb     Oh      C        88.2       117.3"
-#         "  C       Hc      Hc      79         106.4"
-#         "  C       C       Hc      88.8       110"
-#         "  C       Sb     Hc       69.2       112.3"
-#         "  C       Sb     C        69.2       112.3"
-#         "  C       C       C       93.2       110.5"
-#         ""
-#         "torsion intra bond kcal"
-#         "Ob     Sb   C    Hc   -0.1000      3"
-#         "Ob     Sb   C    C     0.1111      3"
-#         "Oh     Sb   C    Hc   -0.1000      3"
-#         "Oh     Sb   C    C     0.1111      3"
-#         "Hc     C     C    Hc    0.1581      3"
-#         "C      C     C    Hc    0.1581      3"
-#         "Sb    C     C    Hc    0.1581      3"
-#         "Sb    C     C    C     0.1581      3"
-#         "C      C     C    C     0.1581      3"
-
-
-#                         string(ff)
-#                         "cartesian"
-#                         bx.elems(:)+"  "+string(n2s(bx.coords))+"  "+n2s(bx.atom_charge(:))
-#                         ""
-#                         "connect "+string(n2s(bx.bonds(:,2:end)))
-#                         ""
-#                         ..."pressure var"
-#                         ""
-#                         "maxcyc opt     5000"
-#                         "switch_min rfo   gnorm     0.001"
-#                         ""
-#                         "rtol   1.5000"
-#                         "dump every     10 csh0p8.res                                                "
-#                         ""
-#                         "output dcd movie"
-#                         "output xyz movie"
-#                         "temperature 300"
-#                         "slower .01"
 
 class Box:
     def __init__(self, comp):

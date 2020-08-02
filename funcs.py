@@ -62,7 +62,7 @@ def alkane(n):
     ch2.add(Port(anchor=ch2['C'], loc_vec=dr2),expand=0)
     [ch2.add_bond(x) for x in [[ch2[0], ch2[1]],[ch2[0], ch2[2]]]]
     alk = Compound(name='alkane')
-    alk.add(ch2)
+    alk.add(deepcopy(ch2))
     for i in range(n-1):
         c_ch2 = deepcopy(ch2)
         alk.add(c_ch2)
@@ -77,7 +77,7 @@ def dimer(nchain):
 
     sil = compload('/home/ali/ongoing_research/polymer4/22_lammps_py_fitting/sil.mol2', compound=Compound(name='sil'),
                    infer_hierarchy=0)  # type: Compound
-    c1, c2 = [6.3001, 4.1639, 6.0570], [8.5253, 8.0180, 6.0570]
+    c2, c1 = [6.3001, 4.1639, 6.0570], [8.5253, 8.0180, 6.0570]
 
     tmp1, tmp2 = c1 - sil['Si1'].pos, c2 - sil['Si2'].pos
     sil.add(Port(sil['Si1'], loc_vec=tmp1, orientation=[0, 0, 1], name='c1'), expand=0)
@@ -129,7 +129,7 @@ def get_lmps(configs, inp_fle='runfile'):
     lmps = []
     frc_lmps = np.empty(configs.shape, dtype=float)
     for i, pos in enumerate(configs):
-        lmp = lammps(cmdargs=['-echo', 'none', '-screen', 'none'])  # type: PyLammps
+        lmp = lammps(cmdargs=['-echo', 'none', '-screen', 'none'])
         lmp.file(inp_fle)
         x = lmp.extract_atom("x", 3)
         for j, p in enumerate(pos):
@@ -138,7 +138,7 @@ def get_lmps(configs, inp_fle='runfile'):
         lmps.append(lmp)
         lmp.command('run 0')
         frc_lmps[i] = np.ctypeslib.as_array(lmp.extract_atom("f", 3).contents, shape=configs[0].shape)
-    return lmps, frc_lmps
+    return lmps[0] if len(lmps)==1 else lmps, frc_lmps
 
 def ev_to_kcalpmol(input):
     from parmed import unit as u
