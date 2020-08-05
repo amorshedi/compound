@@ -57,17 +57,17 @@ def alkane(n, num_caps=0):
     ch2 = Compound(name='ch2', names=['C', 'H', 'H'], pos=[[0,0.5935,0],[0,1.2513,0.8857],[ 0,1.2513,-0.8857]])
 
     dr1, dr2 = [-0.64315, -0.42845, 0], [ 0.64315, -0.42845, 0]
-    ch2.add(Port(anchor=ch2['C'], loc_vec=dr1, orientation=deepcopy(dr1)),expand=0)
-    ch2.add(Port(anchor=ch2['C'], loc_vec=dr2, orientation=deepcopy(dr2)),expand=0)
+    ch2.add(Port(anchor=ch2['C'], orientation=dr1, pos=ch2['C'].pos+dr1),expand=0)
+    ch2.add(Port(anchor=ch2['C'], orientation=dr2, pos=ch2['C'].pos+dr2),expand=0)
     [ch2.add_bond(x) for x in [[ch2[0], ch2[1]],[ch2[0], ch2[2]]]]
     alk = Compound(name='alkane')
     alk.add(deepcopy(ch2))
     for i in range(n-1):
         c_ch2 = deepcopy(ch2)
+        alk.force_overlap(c_ch2, c_ch2['_p'][0], alk[-1], flip=1)
         alk.add(c_ch2)
-        alk.force_overlap(c_ch2, c_ch2[-1], alk[-6], flip=1)
 
-    ch3 = Compound(names=['C', 'H', 'H', 'H', 't'],
+    ch3 = Compound(names=['C', 'H', 'H', 'H'],
                          pos=[[-0.0000,   0.0000,   0.0000],
                               [ 0.6252,   0.6252,   0.6252],
                               [-0.6252,  -0.6252,   0.6252],
@@ -76,50 +76,13 @@ def alkane(n, num_caps=0):
     [ch3.add_bond(x) for x in product([ch3[0]], ch3.particles()[1:])]
 
     dr = np.array([ 0.6252,  -0.6252,  -0.6252])/2
-    ch3.add(Port(anchor=ch3['C'],loc_vec=dr, orientation=deepcopy(dr)), expand=0)
+    ch3.add(Port(anchor=ch3['C'],pos=dr, orientation=-dr), expand=0)
 
     for i in range(num_caps):
         cp = deepcopy(ch3)
         alk.add(cp)
-        alk.force_overlap(cp, cp['port'], alk['port'][0]  , flip=1)
+        alk.force_overlap(cp, cp['_p'], alk['_p'][-2], flip=0)
 
-
-    ch3 = Compound(name='ch3', names=['C', 'H', 'H', 'H'], pos=[[0, 0.5935, 0], [0, 1.2513, 0.8857], [0, 1.2513, -0.8857], [-0.91285806, -0.01462258,  0.]])
-    ch3.add(Port(anchor=ch3['C'], loc_vec=dr2), expand=0)
-    from itertools import product
-    [ch3.add_bond(x) for x in product([ch3[0]], ch3.particles()[1:])]
-    for i in range(num_caps):
-        cp = deepcopy(ch3)
-        alk.add(cp)
-        # if i==1:
-        #     cp.translate_to(alk['port'][0].center(1))
-        #     cp[-1].xyz_with_ports = cp[-1].reflect(cp[-1].xyz_with_ports,
-        #                                          cp[-1].center(1),cp[-1].orientation)
-        alk.force_overlap(cp, cp[-1], alk['port'][0], flip=1)
-
-
-
-    ch3 = Compound(names=['C', 'H', 'H', 'H', 't'],
-                         pos=[[-0.0000,   0.0000,   0.0000],
-                              [ 0.6252,   0.6252,   0.6252],
-                              [-0.6252,  -0.6252,   0.6252],
-                              [-0.6252,   0.6252,  -0.6252],
-                              [ 0.6252,  -0.6252,  -0.6252]])
-    from itertools import product
-    [ch3.add_bond(x) for x in product([ch3[0]], ch3.particles()[1:])]
-
-    ch3.rotate(ch3['t'].pos, alk['port'][0].center(1)-alk['C'].pos)
-    ch3.add(Port(anchor=ch3['C'],loc_vec=ch3['t'].pos/2), expand=0)
-    ch3.remove(ch3['t'])
-    # vec /= norm(vec)
-    ch3.xyz_with_ports += 2
-    for i in range(num_caps):
-        cp = deepcopy(ch3)
-        alk.add(cp)
-
-        cp['C'].name = 'G'
-        cp.translate_to(alk['port'][0][0].pos)
-        alk.force_overlap(cp, cp['port'], alk['port'][0], flip=0)
 
     return alk
 

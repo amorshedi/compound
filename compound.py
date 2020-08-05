@@ -271,17 +271,22 @@ class Compound(object):
         else:
             self._latmat = vec
         
-    @staticmethod
-    def reflect(p, pp, pvec):
+    # @staticmethod
+    def reflect(self, pp, pvec):
         """ image of a point with respect to a plane
         p: point
         pp: point in the plane
         pvect: normal to the plane"""
 
-        p, pp, pvec = [np.array(x) for x in [p, pp, pvec]]
+        pp, pvec = map(np.array, [pp, pvec])
         n = pvec / norm(pvec)
-        t = np.sum((pp - p) * n, axis=1)
-        return p + 2 * np.array([x * n for x in t])
+        t = np.sum((pp - self.xyz_with_ports) * n, axis=1)
+        self.xyz_with_ports += 2 * np.array([x * n for x in t])
+
+        for x in self.particles_by_name('_p'):
+            tmp = Compound(pos=x.orientation)
+            tmp.reflect(pp, pvec)
+            x.orientation = tmp.pos
     
     def particles(self,ports=0):
         return list(self._particles(ports))
@@ -1471,7 +1476,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         by : np.ndarray, shape=(3,), dtype=float
 
         """
-        self.xyz_with_ports = self.xyz_with_ports+by
+        self.xyz_with_ports += by
 
     def translate_to(self, pos):
         """Translate the Compound to a specific position
@@ -2515,41 +2520,22 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         compound.xyz_with_ports = atom_positions
 
 
-    def force_overlap(self,move_this, from_positions, to_positions, add_bond=1,flip=0):
-        """Computes an affine transformation that maps the from_positions to the
-        respective to_positions, and applies this transformation to the compound.
-
-        Parameters
-        ----------
-        move_this : mb.Compound
-            The Compound to be moved.
-        from_positions : np.ndarray, shape=(n, 3), dtype=float
-            Original positions.
-        to_positions : np.ndarray, shape=(n, 3), dtype=float
-            New positions.
-        add_bond : bool, optional, default=True
-            If `from_positions` and `to_positions` are `Ports`, create a bond
-            between the two anchor atoms.
+    def force_overlap(self,comp_to_mv,port_of_comp,port_of_target,add_bond=1,flip=0):
+        """
 
         """
-        if flip==1:
-            from_positions.xyz_with_ports = self.reflect(from_positions.xyz_with_ports,
-                                                         from_positions.center(1),from_positions.orientation)
-        T = transform_mat(from_positions.xyz_with_ports, to_positions.xyz_with_ports)
-        move_this.xyz_with_ports = apply_transform(T, move_this.xyz_with_ports)
-        # T = RigidTransform(from_positions.xyz_with_ports, to_positions.xyz_with_ports)
+        comp_to_mv.xyz_with_ports -= port_of_comp.pos
+        comp_to_mv.rotate(port_of_comp.orientation, port_of_target.orientation, pnt=port_of_comp.pos)
+        # comp_to_mv.xyz_with_ports += 1.5
+        if flip:
+            comp_to_mv.reflect(port_of_comp.pos, port_of_comp.orientation)
 
-        if add_bond:
-            if not from_positions.anchor or not to_positions.anchor:
-                warn("Attempting to form bond from port that has no anchor")
-            else:
-                from_positions.anchor.root.add_bond((from_positions.anchor, to_positions.anchor))
-                to_positions.anchor.root.add_bond((from_positions.anchor, to_positions.anchor))
-                from_positions.anchor.parent.remove(from_positions)
-                to_positions.anchor.parent.remove(to_positions)
-        elif from_positions.port_particle and to_positions.port_particle:
-            from_positions.parent.remove(from_positions)
-            to_positions.parent.remove(to_positions)
+        comp_to_mv.translate(port_of_target.pos)
+
+        if port_of_comp.anchor and port_of_target.anchor:
+            self.add_bond([port_of_comp.anchor, port_of_target.anchor])
+            port_of_comp.parent.remove(port_of_comp)
+            port_of_target.parent.remove(port_of_target)
 
 
     def _create_equivalence_transform(self,equiv):
@@ -3177,13 +3163,19 @@ end structure
             f.write("\nthree bond intra regular kcal\n")
             for x in self.ff.atom_types:
                 f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]}  {2*float(x['k'])}  {x['angle']}\n")
-    def rotate(self, v1, v2):
+    def rotate(self, v1, v2, pnt=None):
         ''' rotates the particles according to the angle between v1 and v2'''
         v1, v2 = map(np.array, [v1, v2])
         v1, v2 = map(lambda x:x/norm(x), [v1, v2])
         normal = np.cross(v1, v2)
-        self.xyz_with_ports = R.from_rotvec(normal*angle_between_vecs(v1, v2, in_degrees=0)).apply(
-                self.xyz_with_ports-self.center(1)) + self.center(1)
+        if np.allclose(normal, 0):
+            if not np.array_equal(pnt, None):
+                self.reflect(pnt, v1)
+            return
+        rot = R.from_rotvec(normal*angle_between_vecs(v1, v2, in_degrees=0)/norm(normal))
+        self.xyz_with_ports = rot.apply(self.xyz_with_ports)
+        for x in self.particles_by_name('_p'):
+            x.orientation = rot.apply(x.orientation)
 
 
 class Box:
@@ -3278,30 +3270,9 @@ class Port(Compound):
     type: up or down: decide whether to flip
 
     """
-    def __init__(self, anchor=[0,0,0], orientation=[0, 1, 0], loc_vec=[0, 0, 1],
-                 separation=None,type='up',name='port'):
-        super(Port, self).__init__(name=name)
-        default_orientation = [0, 1, 0]
-        if isinstance(anchor, Compound):
-            self.anchor = anchor
-            anchor = anchor.pos
+    def __init__(self, anchor=None, orientation=[1, 0, 0], pos=[0, 0, 0], name='_p'):
 
-        orientation, loc_vec = map(lambda x:np.asarray(x, dtype=float), [orientation, loc_vec])
-        orientation /= norm(orientation)
+        orientation, loc_vec = map(np.asarray, [orientation, pos])
 
-        coords = [[0.05, 0.025, -0.025],
-                  [0.05, 0.225, -0.025],
-                  [-0.15, -0.075, -0.025],
-                  [0.05, -0.175, 0.075]]
-
-        for x in coords:
-            self.add(Compound(name='_p',pos=x))
-        # rotate the ports to get proper orientation
-        self.rotate(default_orientation, orientation)
-
-        self.translate_to(anchor+separation*unit_vector(loc_vec) if separation != None
-                              else anchor+loc_vec)
-
-        if type != 'up':
-            self.xyz_with_ports = self.reflect(self.xyz_with_ports,np.zeros(3),orientation)
-        self.orientation = orientation
+        super(Port, self).__init__(name=name, pos=pos)
+        self.anchor, self.orientation = anchor, orientation / norm(orientation)
