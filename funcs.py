@@ -1,6 +1,6 @@
 import numpy as np
 import os, re, subprocess, math, io
-from lammps import PyLammps, lammps
+from lammps import lammps
 from numpy.linalg import norm, svd
 from math import degrees, radians
 from collections.abc import Iterable
@@ -50,23 +50,76 @@ def apply_transform(T, points):
     return (T @ np.vstack([points.T, one_row]))[0:3,:].T
 
 
-def alkane(n):
+def alkane(n, num_caps=0):
     from compound import Compound, Port
-    ch2 = Compound(name='ch2')
-    ch2.add(Compound(name='C',pos=[0,0.5935,0]))
-    ch2.add(Compound(name='H',pos=[0,1.2513,0.8857]))
-    ch2.add(Compound(name='H',pos=[ 0,1.2513,-0.8857]))
+    from scipy.spatial.transform import Rotation as R
+
+    ch2 = Compound(name='ch2', names=['C', 'H', 'H'], pos=[[0,0.5935,0],[0,1.2513,0.8857],[ 0,1.2513,-0.8857]])
 
     dr1, dr2 = [-0.64315, -0.42845, 0], [ 0.64315, -0.42845, 0]
-    ch2.add(Port(anchor=ch2['C'], loc_vec=dr1),expand=0)
-    ch2.add(Port(anchor=ch2['C'], loc_vec=dr2),expand=0)
+    ch2.add(Port(anchor=ch2['C'], loc_vec=dr1, orientation=deepcopy(dr1)),expand=0)
+    ch2.add(Port(anchor=ch2['C'], loc_vec=dr2, orientation=deepcopy(dr2)),expand=0)
     [ch2.add_bond(x) for x in [[ch2[0], ch2[1]],[ch2[0], ch2[2]]]]
     alk = Compound(name='alkane')
     alk.add(deepcopy(ch2))
     for i in range(n-1):
         c_ch2 = deepcopy(ch2)
         alk.add(c_ch2)
-        alk.force_overlap(c_ch2, c_ch2[-2], alk[-6], flip=1)
+        alk.force_overlap(c_ch2, c_ch2[-1], alk[-6], flip=1)
+
+    ch3 = Compound(names=['C', 'H', 'H', 'H', 't'],
+                         pos=[[-0.0000,   0.0000,   0.0000],
+                              [ 0.6252,   0.6252,   0.6252],
+                              [-0.6252,  -0.6252,   0.6252],
+                              [-0.6252,   0.6252,  -0.6252]])
+    from itertools import product
+    [ch3.add_bond(x) for x in product([ch3[0]], ch3.particles()[1:])]
+
+    dr = np.array([ 0.6252,  -0.6252,  -0.6252])/2
+    ch3.add(Port(anchor=ch3['C'],loc_vec=dr, orientation=deepcopy(dr)), expand=0)
+
+    for i in range(num_caps):
+        cp = deepcopy(ch3)
+        alk.add(cp)
+        alk.force_overlap(cp, cp['port'], alk['port'][0]  , flip=1)
+
+
+    ch3 = Compound(name='ch3', names=['C', 'H', 'H', 'H'], pos=[[0, 0.5935, 0], [0, 1.2513, 0.8857], [0, 1.2513, -0.8857], [-0.91285806, -0.01462258,  0.]])
+    ch3.add(Port(anchor=ch3['C'], loc_vec=dr2), expand=0)
+    from itertools import product
+    [ch3.add_bond(x) for x in product([ch3[0]], ch3.particles()[1:])]
+    for i in range(num_caps):
+        cp = deepcopy(ch3)
+        alk.add(cp)
+        # if i==1:
+        #     cp.translate_to(alk['port'][0].center(1))
+        #     cp[-1].xyz_with_ports = cp[-1].reflect(cp[-1].xyz_with_ports,
+        #                                          cp[-1].center(1),cp[-1].orientation)
+        alk.force_overlap(cp, cp[-1], alk['port'][0], flip=1)
+
+
+
+    ch3 = Compound(names=['C', 'H', 'H', 'H', 't'],
+                         pos=[[-0.0000,   0.0000,   0.0000],
+                              [ 0.6252,   0.6252,   0.6252],
+                              [-0.6252,  -0.6252,   0.6252],
+                              [-0.6252,   0.6252,  -0.6252],
+                              [ 0.6252,  -0.6252,  -0.6252]])
+    from itertools import product
+    [ch3.add_bond(x) for x in product([ch3[0]], ch3.particles()[1:])]
+
+    ch3.rotate(ch3['t'].pos, alk['port'][0].center(1)-alk['C'].pos)
+    ch3.add(Port(anchor=ch3['C'],loc_vec=ch3['t'].pos/2), expand=0)
+    ch3.remove(ch3['t'])
+    # vec /= norm(vec)
+    ch3.xyz_with_ports += 2
+    for i in range(num_caps):
+        cp = deepcopy(ch3)
+        alk.add(cp)
+
+        cp['C'].name = 'G'
+        cp.translate_to(alk['port'][0][0].pos)
+        alk.force_overlap(cp, cp['port'], alk['port'][0], flip=0)
 
     return alk
 
@@ -153,15 +206,17 @@ def get_file_num(outdir):
     except:
 	    return 1
 
-def coords_forces_from_outcar(direc, nump,save_npy=0):
+def coords_forces_from_outcar(direc, save_npy=0):
     '''direc: outcar directory
        nump: number of particles'''
 
+    n = subprocess.check_output(f' grep -oP -m 1 \'(?<=NIONS =)\\s*[0-9]*\' {os.path.join(direc,"OUTCAR")} ', shell=1)
+    n = int(n.decode('utf-8'))
     dft_pos_frc = subprocess.check_output(
         f'''awk '/TOTAL-/{{getline;getline;flg=1}};/--/{{flg=0}}flg{{print $1, $2, $3, $4, $5, $6}}' {direc}/OUTCAR ''', shell=1)
     dft_pos_frc = np.vstack([np.fromstring(x, np.float, sep=' ')
                         for x in dft_pos_frc.decode('utf-8').split('\n')[:-1]])
-    dft_pos_frc = cut_array2d(dft_pos_frc, [len(dft_pos_frc)//nump, 1])
+    dft_pos_frc = cut_array2d(dft_pos_frc, [len(dft_pos_frc) // n, 1])
 
     return [x[:, :3] for x in dft_pos_frc], [x[:, 3:] for x in dft_pos_frc]
 
@@ -185,7 +240,9 @@ def cut_array2d(array, shape):
                 blocks[i, j] = val
     return blocks
 
-def get_vasp_hessian(direc, n):
+def get_vasp_hessian(direc):
+    n = subprocess.check_output(f' grep -oP -m 1 \'(?<=NIONS =)\\s*[0-9]*\' {os.path.join(direc,"OUTCAR")} ', shell=1)
+    n = int(n.decode('utf-8'))
     hessian = subprocess.check_output(
         f''' awk '/^  1X/{{flg=1}};/^ Eigen/{{flg=0}}flg{{$1="";print $0}}' {direc}/OUTCAR ''',
         shell=1)
@@ -204,7 +261,7 @@ def  unit_perps(ang, coords):
     u_N = cross_product / norm(cross_product)
 
     u_PA = np.cross(u_N, u_AB)
-    u_PC = np.cross(u_N, u_CB)
+    u_PC = -np.cross(u_N, u_CB)
 
     return u_PA / norm(u_PA), u_PC / norm(u_PC), math.degrees(math.acos(np.dot(u_AB, u_CB)))
 

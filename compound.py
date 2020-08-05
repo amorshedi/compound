@@ -1,34 +1,32 @@
+import networkx as nx
 import numpy as np
-from collections import OrderedDict, defaultdict, Iterable
-from copy import deepcopy
-import os, sys, tempfile, importlib
-from warnings import warn
-from itertools import chain, compress
+from collections.abc import Iterable
+from collections import OrderedDict, defaultdict
+
+# from copy import deepcopy
+import os, math#, sys, tempfile, importlib
+# from warnings import warn
+from itertools import chain, compress, combinations
 import mdtraj as md
 from mdtraj.core.element import get_by_symbol
-from oset import oset as OrderedSet
 import parmed as pmd
+from scipy.spatial.transform import Rotation as R
 from parmed.periodic_table import AtomicNum, element_by_name, Mass, Element
-from funcs import *
-from os import system as syst
-
-from openbabel import openbabel as ob
-# from openbabel import pybel as pb
-from pymatgen.util.coord import pbc_shortest_vectors, get_angle
-from pymatgen.core import Structure
-from itertools import combinations
-
-import mdtraj.geometry as geom
-from pymatgen import Lattice, Structure
-# from openbabel import pybel
-
+from funcs import angle_between_vecs, transform_mat, apply_transform
+# from os import system as syst
+#
+# # from openbabel import openbabel as ob
+# # from openbabel import pybel as pb
+# from pymatgen.util.coord import pbc_shortest_vectors, get_angle
+# from pymatgen.core import Structure
+#
+# import mdtraj.geometry as geom
+# from pymatgen import Lattice, Structure
+# # from openbabel import pybel
+#
 from numpy.linalg import inv, norm, det
-from coordinate_transform import _translate, _rotate,AxisTransform,RigidTransform, unit_vector, angle
-from foyer.forcefield import Forcefield
-from collections import defaultdict
-from foyer.smarts_graph import SMARTSGraph
-from networkx.algorithms import isomorphism
-import networkx as nx
+# from coordinate_transform import _translate, _rotate,AxisTransform,RigidTransform, unit_vector, angle
+# from collections import defaultdict
 from orderedset import OrderedSet
 
 #to do list:
@@ -237,8 +235,8 @@ class Compound(object):
     def __init__(self, name='comp', names=None, pos=None):
 
         self.name = name
-        
-        if pos is not None and (pos.ndim == 1 or pos.shape[0] == 1):
+        pos = np.array(pos)
+        if not np.array_equal(pos, None) and (pos.ndim == 1 or pos.shape[0] == 1):
             self._pos = pos.flatten()
         else:
             self._pos = np.zeros(3)
@@ -331,11 +329,10 @@ class Compound(object):
             for subpart in part.successors():
                 yield subpart
 
-    @property
-    def bonds_angles_index(self):
+    def bonds_angles_index(self, sorted=1):
         bond_list = []
         angle_list = []
-        nlst = self.particles_label_sorted()
+        nlst = self.particles_label_sorted() if sorted else self.particles()
         for i, bond in enumerate(self.bonds_typed, 1):
             bond_list.append([nlst.index(j) for j in bond])
         for i, angle in enumerate(self.angles_typed, 1):
@@ -736,11 +733,11 @@ class Compound(object):
 
         if mol2:
             self.save('out.mol2')
-            os.system('vmd out.mol2 -e txt')
+            os.system('/home/ali/software/vmd-1.9.4a43/bin2/vmd out.mol2 -e txt')
             os.system('rm out.mol2 txt')
         else:
             self.write_lammpstrj(ports=ports,label_sorted=label_sorted)
-            os.system('vmd out.lammpstrj -e txt')
+            os.system('/home/ali/software/vmd-1.9.4a43/bin2/vmd out.lammpstrj -e txt')
             os.system('rm out.lammpstrj txt')
 
     def write_lammpstrj(self, fle='out', unit_set='real',ports=1, label_sorted=1):
@@ -1486,23 +1483,6 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         """
         self.translate(pos - self.center(1))
 
-    def rotate(self, theta, around, degrees = 1):
-        """Rotate Compound around an arbitrary vector.
-
-        Parameters
-        ----------
-        theta : float
-            The angle by which to rotate the Compound, in radians.
-        around : np.ndarray, shape=(3,), dtype=float
-            The vector about which to rotate the Compound.
-
-        """
-        import math
-        if degrees:
-            theta = math.radians(theta)
-        new_positions = _rotate(self.xyz_with_ports-self.center(1), theta, around)
-        self.xyz_with_ports = new_positions+self.center(1)
-
     def spin(self, theta, around):
         """Rotate Compound in place around an arbitrary vector.
 
@@ -1627,7 +1607,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
 
         return md.Trajectory(self.xyz, top, \
                              unitcell_lengths=[np.linalg.norm(x) for x in self.latmat],
-                             unitcell_angles=[get_angle(v1,v2) for v1,v2 in combinations(self.latmat,2)][::-1])
+                             unitcell_angles=[angle_between_vecs(v1,v2) for v1,v2 in combinations(self.latmat,2)][::-1])
 
     def _to_topology(self, atom_list, chains=None, residues=None):
         """Create a mdtraj.Topology from a Compound.
@@ -2571,6 +2551,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             from_positions.parent.remove(from_positions)
             to_positions.parent.remove(to_positions)
 
+
     def _create_equivalence_transform(self,equiv):
         """Compute an equivalence transformation that transforms this compound
         to another compound's coordinate system.
@@ -2685,7 +2666,10 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
 
 
     def applyff(self,file):
-
+        from foyer.forcefield import Forcefield
+        from foyer.smarts_graph import SMARTSGraph
+        from networkx.algorithms.isomorphism import GraphMatcher
+        
         self.ff = Forcefield(file)
 
         self.typemap = {x: {'whitelist': set(), 'blacklist': set(),
@@ -2706,7 +2690,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         [self.bond_graph.add_node(n,atom=n) for n in nlst]
 
         for type in self.ff.atom_types:
-            gm = isomorphism.GraphMatcher(self.bond_graph,type['graph'],node_match=self._node_match)
+            gm = GraphMatcher(self.bond_graph,type['graph'],node_match=self._node_match)
             matches = {y[0] for x in gm.subgraph_isomorphisms_iter() for y in x.items() if y[1] == 0}
             for atom in matches:
                 atom.type.append(type)
@@ -3193,6 +3177,13 @@ end structure
             f.write("\nthree bond intra regular kcal\n")
             for x in self.ff.atom_types:
                 f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]}  {2*float(x['k'])}  {x['angle']}\n")
+    def rotate(self, v1, v2):
+        ''' rotates the particles according to the angle between v1 and v2'''
+        v1, v2 = map(np.array, [v1, v2])
+        v1, v2 = map(lambda x:x/norm(x), [v1, v2])
+        normal = np.cross(v1, v2)
+        self.xyz_with_ports = R.from_rotvec(normal*angle_between_vecs(v1, v2, in_degrees=0)).apply(
+                self.xyz_with_ports-self.center(1)) + self.center(1)
 
 
 class Box:
@@ -3290,14 +3281,13 @@ class Port(Compound):
     def __init__(self, anchor=[0,0,0], orientation=[0, 1, 0], loc_vec=[0, 0, 1],
                  separation=None,type='up',name='port'):
         super(Port, self).__init__(name=name)
-        self.port_particle = 1
         default_orientation = [0, 1, 0]
         if isinstance(anchor, Compound):
             self.anchor = anchor
             anchor = anchor.pos
 
-        orientation, loc_vec = map(np.asarray, [orientation, loc_vec])
-        orientation = orientation/norm(orientation)
+        orientation, loc_vec = map(lambda x:np.asarray(x, dtype=float), [orientation, loc_vec])
+        orientation /= norm(orientation)
 
         coords = [[0.05, 0.025, -0.025],
                   [0.05, 0.225, -0.025],
@@ -3307,12 +3297,11 @@ class Port(Compound):
         for x in coords:
             self.add(Compound(name='_p',pos=x))
         # rotate the ports to get proper orientation
-        normal = np.cross(default_orientation, orientation)
-        self.rotate(angle(default_orientation, orientation), normal, degrees=0)
+        self.rotate(default_orientation, orientation)
 
         self.translate_to(anchor+separation*unit_vector(loc_vec) if separation != None
                               else anchor+loc_vec)
 
-        if type is not 'up':
+        if type != 'up':
             self.xyz_with_ports = self.reflect(self.xyz_with_ports,np.zeros(3),orientation)
         self.orientation = orientation
