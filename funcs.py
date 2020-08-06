@@ -4,6 +4,7 @@ from lammps import lammps
 from numpy.linalg import norm, svd
 from math import degrees, radians
 from collections.abc import Iterable
+from parmed import unit as u
 # from lib.recipes.alkane import Alkane
 # from compound import Compound, compload, Port
 from copy import deepcopy
@@ -209,7 +210,8 @@ def get_vasp_hessian(direc):
     hessian = subprocess.check_output(
         f''' awk '/^  1X/{{flg=1}};/^ Eigen/{{flg=0}}flg{{$1="";print $0}}' {direc}/OUTCAR ''',
         shell=1)
-    return np.float_(hessian.decode('utf-8').split()).reshape(n * 3, n * 3)
+    return (u.AVOGADRO_CONSTANT_NA._value *(np.genfromtxt(io.BytesIO(hessian)) *
+                                            u.elementary_charge * u.volts).in_units_of(u.kilocalorie))._value
 
 def  unit_perps(ang, coords):
     #This gives the vector in the plane A,B,C and perpendicular to A to B
