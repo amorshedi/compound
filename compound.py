@@ -2,8 +2,8 @@ import networkx as nx
 import numpy as np
 from collections.abc import Iterable
 from collections import OrderedDict, defaultdict
-
-# from copy import deepcopy
+from ismember import ismember
+from copy import deepcopy
 import os, math#, sys, tempfile, importlib
 # from warnings import warn
 from itertools import chain, compress, combinations
@@ -12,13 +12,14 @@ from mdtraj.core.element import get_by_symbol
 import parmed as pmd
 from scipy.spatial.transform import Rotation as R
 from parmed.periodic_table import AtomicNum, element_by_name, Mass, Element
-from funcs import angle_between_vecs, transform_mat, apply_transform
+from funcs import angle_between_vecs, transform_mat, apply_transform, get_lmps
+from openbabel import pybel,openbabel
 # from os import system as syst
 #
 # # from openbabel import openbabel as ob
 # # from openbabel import pybel as pb
 # from pymatgen.util.coord import pbc_shortest_vectors, get_angle
-# from pymatgen.core import Structure
+from pymatgen.core import Structure
 #
 # import mdtraj.geometry as geom
 # from pymatgen import Lattice, Structure
@@ -33,8 +34,18 @@ from orderedset import OrderedSet
 # ForceField from foyer should be in this file somehow
 # nonbond types should have somethig similar to bonds_typed (maybe add 'nonbond' to each atom)
 
+def from_pymatgen(structure):
+    """ convert pymatgen structure to compound """
+
+    comp = Compound(names=[x.specie.name for x in structure.sites], pos=structure.cart_coords)
+    comp.latmat = structure.lattice.matrix
+    comp.latmat.setflags(write=1)
+
+    return comp
+
+
 def compload(filename_or_object, relative_to_module=None, compound=None, coords_only=False,
-         rigid=False, use_parmed=False, smiles=False,
+         use_parmed=False, smiles=False,
          infer_hierarchy=True, **kwargs):
     """Load a file or an existing topology into an mbuild compound.
 
@@ -48,17 +59,10 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
     filename_or_object : str, mdtraj.Trajectory, parmed.Structure, mbuild.Compound,
             pybel.Molecule
         Name of the file or topology from which to load atom and bond information.
-    relative_to_module : str, optional, default=None
-        Instead of looking in the current working directory, look for the file
-        where this module is defined. This is typically used in Compound
-        classes that will be instantiated from a different directory
-        (such as the Compounds located in mbuild2.lib).
     compound : mb.Compound, optional, default=None
         Existing compound to load atom and bond information into.
     coords_only : bool, optional, default=False
         Only load the coordinates into an existing compound.
-    rigid : bool, optional, default=False
-        Treat the compound as a rigid body
     use_parmed : bool, optional, default=False
         Use readers from ParmEd instead of MDTraj.
     smiles: bool, optional, default=False
@@ -90,7 +94,6 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
         if isinstance(filename_or_object, type):
             type_dict[type](filename_or_object,coords_only=coords_only,
                     infer_hierarchy=infer_hierarchy, **kwargs)
-            return compound
 
     # Handle mbuild2 *.py files containing a class that wraps a structure file
     # in its own folder. E.g., you build a system from ~/foo.py and it imports
@@ -106,7 +109,6 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
     extension = os.path.splitext(filename_or_object)[-1]
     if extension == '.json':
         compound = compound_from_json(filename_or_object)
-        return compound
 
     if extension == '.xyz' and not 'top' in kwargs:
         if coords_only:
@@ -121,7 +123,6 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
                 particle.pos = ref_particle.pos
         else:
             compound = compound.read_xyz(filename_or_object)
-        return compound
 
     if extension == '.sdf':
         pybel_mol = pybel.readfile('sdf', filename_or_object)
@@ -129,7 +130,12 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
         # Raise ValueError user if there are more molecules
         pybel_mol = [i for i in pybel_mol]
         compound.from_pybel(pybel_mol[0])
-        return compound
+
+    if 'POSCAR' in filename_or_object or 'CONTCAR' in filename_or_object:
+        return from_pymatgen(Structure.from_file(filename_or_object))
+
+    if extension == '.cif':
+        return from_pymatgen(Structure.from_file(filename_or_object)) #type: Compound
 
     if use_parmed:
         # warn(
@@ -174,8 +180,6 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
 
         compound.from_trajectory(traj, frame=-1, infer_hierarchy=infer_hierarchy)
 
-    if rigid:
-        compound.label_rigid_bodies()
     return compound
 
 
@@ -244,7 +248,6 @@ class Compound(object):
         self.parent = None
         self.children = OrderedSet()
         self.referrers = set()
-        self.port_particle = 0
         self.type = []
 
         self.bond_graph = None
@@ -283,7 +286,7 @@ class Compound(object):
         t = np.sum((pp - self.xyz_with_ports) * n, axis=1)
         self.xyz_with_ports += 2 * np.array([x * n for x in t])
 
-        for x in self.particles_by_name('_p'):
+        for x in [z for z in self.particles(1) if '!' in z.name]:
             tmp = Compound(pos=x.orientation)
             tmp.reflect(pp, pvec)
             x.orientation = tmp.pos
@@ -307,7 +310,7 @@ class Compound(object):
 
         """
         if not self.children:
-            if self.name == '_p' and not ports:
+            if '!' in self.name and not ports:
                 yield from []
             else:
                 yield self
@@ -417,29 +420,10 @@ class Compound(object):
             inherit_periodicity=True, reset_rigid_ids=True):
         """Add a part to the Compound.
 
-        Note:
-            This does not necessarily add the part to self.children but may
-            instead be used to add a reference to the part to self.labels. See
-            'containment' argument.
-
         Parameters
         ----------
         new_child : mb.Compound or list-like of mb.Compound
             The object(s) to be added to this Compound.
-        label : str, optional
-            A descriptive string for the part.
-        containment : bool, optional, default=True
-            Add the part to self.children.
-        replace : bool, optional, default=True
-            Replace the label if it already exists.
-        inherit_periodicity : bool, optional, default=True
-            Replace the periodicity of self with the periodicity of the
-            Compound being added
-        reset_rigid_ids : bool, optional, default=True
-            If the Compound to be added contains rigid bodies, reset the
-            rigid_ids such that values remain distinct from rigid_ids
-            already present in `self`. Can be set to False if attempting
-            to add Compounds to an existing rigid body.
 
         """
         # Support batch add via lists, tuples and sets.
@@ -493,53 +477,12 @@ class Compound(object):
         objs_to_remove = set(objs_to_remove)
 
         for obj in objs_to_remove:
-            if self.root.bond_graph: #take care of removing bonds
+            if obj.root.bond_graph: #take care of removing bonds
                 for p in obj.particles(0):
-                    if self.root.bond_graph.has_node(p):
-                        self.root.bond_graph.remove_node(p)
-            if obj in self.children:
-                self.children.remove(obj)
-            else:
-                for obj2 in self.children:
-                    obj2.remove(obj)
+                    if obj.root.bond_graph.has_node(p):
+                        obj.root.bond_graph.remove_node(p)
+            obj.parent.children.remove(obj)
 
-    def referenced_ports(self):
-        """Return all Ports referenced by this Compound.
-
-        Returns
-        -------
-        list of mb.Compound
-            A list of all ports referenced by the Compound
-
-        """
-        from mbuild2.port import Port
-        return [port for port in self.labels.values()
-                if isinstance(port, Port)]
-
-    def all_ports(self):
-        """Return all Ports referenced by this Compound and its successors
-
-        Returns
-        -------
-        list of mb.Compound
-            A list of all Ports referenced by this Compound and its successors
-
-        """
-        return [successor for successor in self.successors()
-                if isinstance(successor, Port)]
-
-    def available_ports(self):
-        """Return all unoccupied Ports referenced by this Compound.
-
-        Returns
-        -------
-        list of mb.Compound
-            A list of all unoccupied ports referenced by the Compound
-
-        """
-        from mbuild2.port import Port
-        return [port for port in self.labels.values()
-                if isinstance(port, Port) and not port.used]
 
     def add_bond(self, particle_pair):
         """Add a bond between two Particles.
@@ -595,13 +538,6 @@ class Compound(object):
             warn("Particles {} and {} overlap! Ports will not be added."
                  "".format(*particle_pair))
             return
-        # distance = norm(bond_vector)
-        # particle_pair[0].parent.add(Port(anchor=particle_pair[0],
-        #                                  orientation=-bond_vector,
-        #                                  separation=distance / 2))
-        # particle_pair[1].parent.add(Port(anchor=particle_pair[1],
-        #                                  orientation=bond_vector,
-        #                                  separation=distance / 2))
 
     @property
     def pos(self):
@@ -1468,16 +1404,6 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         else:  # ParmEd supported saver.
             structure.save(filename, overwrite=1, **kwargs)
 
-    def translate(self, by):
-        """Translate the Compound by a vector
-
-        Parameters
-        ----------
-        by : np.ndarray, shape=(3,), dtype=float
-
-        """
-        self.xyz_with_ports += by
-
     def translate_to(self, pos):
         """Translate the Compound to a specific position
 
@@ -1816,17 +1742,6 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         return Structure(Lattice.from_parameters(*trj.unitcell_lengths,*trj.unitcell_angles),\
                          [x.name for x in self.particles()],self.xyz)
 
-    def from_pymatgen(self, structure):
-        """ convert pymatgen structure to compound """
-        self.add([Compound() for i in range(structure.num_sites)])
-        self.xyz = structure.cart_coords
-        self.latmat = structure.lattice.matrix
-        self.latmat.setflags(write=1)
-        for x,y in zip(self.particles(0),structure.sites):
-            x.name=y.specie.name
-        # tmp = [structure.sites[i].specie.name for i in range(self.n_particles)]
-        # [x.name=y for x,y in zip(self.particles(),tmp)]
-
 
     def to_parmed(self, box=None, title='', residues=None, show_ports=False,
             infer_residues=False):
@@ -1881,7 +1796,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
 
         # Loop through particles and add initialize ParmEd atoms
         for atom in self.particles(0):
-            if atom.port_particle:
+            if '!' in atom.name:
                 current_residue = port_residue
                 atom_residue_map[atom] = current_residue
 
@@ -1922,9 +1837,9 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
                 except KeyError:
                     element = element_by_name(atom.name.capitalize())
                     if name not in guessed_elements:
-                        warn(
-                            'Guessing that "{}" is element: "{}"'.format(
-                                atom, element))
+                        # warn(
+                        #     'Guessing that "{}" is element: "{}"'.format(
+                        #         atom, element))
                         guessed_elements.add(name)
                 else:
                     element = atom.name.capitalize()
@@ -2007,8 +1922,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             nodes, edges = child._iterate_children(nodes, edges, names_only=names_only)
         return nodes, edges
 
-    def to_pybel(self, box=None, title='', residues=None, show_ports=False,
-            infer_residues=False):
+    def to_pybel(self, show_ports=False):
         """ Create a pybel.Molecule from a Compound
 
         Parameters
@@ -2016,7 +1930,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         box : mb.Box, def None
         title : str, optional, default=self.name
             Title/name of the ParmEd Structure
-        residues : str of list of str
+        residues : str or list of str
             Labels of residues in the Compound. Residues are assigned by
             checking against Compound.name.
         show_ports : boolean, optional, default=False
@@ -2036,109 +1950,35 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         OBMol atom indexing starts at 1, with spatial dimension Angstrom
         """
 
-        openbabel = import_('openbabel')
-        pybel = import_('pybel')
-
         mol = openbabel.OBMol()
-        particle_to_atom_index = {}
-
-        if not residues and infer_residues:
-            residues = list(set([child.name for child in self.children]))
-        if isinstance(residues, str):
-            residues = [residues]
-        if isinstance(residues, (list, set)):
-            residues = tuple(residues)
-
-        compound_residue_map = dict()
-        atom_residue_map = dict()
-
-        for i, part in enumerate(self.particles(include_ports=show_ports)):
-            if residues and part.name in residues:
-                current_residue = mol.NewResidue()
-                current_residue.SetName(part.name)
-                atom_residue_map[part] = current_residue
-                compound_residue_map[part] = current_residue
-            elif residues:
-                for parent in part.ancestors():
-                    if residues and parent.name in residues:
-                        if parent not in compound_residue_map:
-                            current_residue = mol.NewResidue()
-                            current_residue.SetName(parent.name)
-                            compound_residue_map[parent] = current_residue
-                        atom_residue_map[part] = current_residue
-                        break
-                else:  # Did not find specified residues in ancestors.
-                    current_residue = mol.NewResidue()
-                    current_residue.SetName("RES")
-                    atom_residue_map[part] = current_residue
-            else:
-                current_residue = mol.NewResidue()
-                current_residue.SetName("RES")
-                atom_residue_map[part] = current_residue
+        particle_to_atom_index = dict()
+        for i, part in enumerate(self.particles(show_ports)):
 
             temp = mol.NewAtom()
-            residue = atom_residue_map[part]
-            temp.SetResidue(residue)
-            if part.port_particle:
+
+            try:
+                temp.SetAtomicNum(AtomicNum[part.name.capitalize()])
+            except KeyError:
+                warn("Could not infer atomic number from "
+                        "{}, setting to 0".format(part.name))
                 temp.SetAtomicNum(0)
-            else:
-                try:
-                    temp.SetAtomicNum(AtomicNum[part.name.capitalize()])
-                except KeyError:
-                    warn("Could not infer atomic number from "
-                            "{}, setting to 0".format(part.name))
-                    temp.SetAtomicNum(0)
 
 
-            temp.SetVector(*(part.xyz[0]*10))
+            temp.SetVector(*(part.pos))
             particle_to_atom_index[part] = i
 
         ucell = openbabel.OBUnitCell()
-        if box is None:
-            box = self.boundingbox
-        a, b, c = 10.0 * box.lengths
-        alpha, beta, gamma = np.radians(box.angles)
+        ucell.SetData(*map(lambda x:openbabel.vector3(*x),self.latmat))
 
-        cosa = np.cos(alpha)
-        cosb = np.cos(beta)
-        sinb = np.sin(beta)
-        cosg = np.cos(gamma)
-        sing = np.sin(gamma)
-        mat_coef_y = (cosa - cosb * cosg) / sing
-        mat_coef_z = np.power(sinb, 2, dtype=float) - \
-                    np.power(mat_coef_y, 2, dtype=float)
-
-        if mat_coef_z > 0.:
-            mat_coef_z = np.sqrt(mat_coef_z)
-        else:
-            raise Warning('Non-positive z-vector. Angles {} '
-                                  'do not generate a box with the z-vector in the'
-                                  'positive z direction'.format(box.angles))
-
-        box_vec = [[1, 0, 0],
-                    [cosg, sing, 0],
-                    [cosb, mat_coef_y, mat_coef_z]]
-        box_vec = np.asarray(box_vec)
-        box_mat = (np.array([a,b,c])* box_vec.T).T
-        first_vector = openbabel.vector3(*box_mat[0])
-        second_vector = openbabel.vector3(*box_mat[1])
-        third_vector = openbabel.vector3(*box_mat[2])
-        ucell.SetData(first_vector, second_vector, third_vector)
-        mol.CloneData(ucell)
-
-        for bond in self.bonds():
+        for bond in self.bond_graph.edges:
             bond_order = 1
             mol.AddBond(particle_to_atom_index[bond[0]]+1,
                     particle_to_atom_index[bond[1]]+1,
                     bond_order)
 
-        pybelmol = pybel.Molecule(mol)
-        pybelmol.title = title if title else self.name
+        return pybel.Molecule(mol)
 
-        return pybelmol
-
-    def from_pybel(self, pybel_mol, use_element=True, coords_only=False,
-            infer_hierarchy=True):
+    def from_pybel(self, pybel_mol, use_element=True):
         """Create a Compound from a Pybel.Molecule
 
         Parameters
@@ -2147,21 +1987,10 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         use_element : bool, default True
             If True, construct mb Particles based on the pybel Atom's element.
             If False, construcs mb Particles based on the pybel Atom's type
-        coords_only : bool, default False
-            Set preexisting atoms in compound to coordinates given by
-            structure.  Note: Not yet implemented, included only for parity
-            with other conversion functions
-        infer_hierarchy : bool, optional, default=True
-            If True, infer hierarchy from residues
-
         """
-        openbabel = import_("openbabel")
         self.name = pybel_mol.title.split('.')[0]
         resindex_to_cmpd = {}
 
-        if coords_only:
-            raise Warning('coords_only=True not yet implemented for '
-                    'conversion from pybel')
         # Iterating through pybel_mol for atom/residue information
         # This could just as easily be implemented by
         # an OBMolAtomIter from the openbabel library,
@@ -2520,22 +2349,27 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         compound.xyz_with_ports = atom_positions
 
 
-    def force_overlap(self,comp_to_mv,port_of_comp,port_of_target,add_bond=1,flip=0):
+    def force_overlap(self,comp_to_mv,port_of_comp,
+                      port_of_target,add_bond=1,flip=0,rotate_ang=0):
         """
+        rotate_ang: in degrees
+        """
+        port_of_comp.orientation /= norm(port_of_comp.orientation)
+        port_of_target.orientation /= norm(port_of_target.orientation)
 
-        """
         comp_to_mv.xyz_with_ports -= port_of_comp.pos
-        comp_to_mv.rotate(port_of_comp.orientation, port_of_target.orientation, pnt=port_of_comp.pos)
-        # comp_to_mv.xyz_with_ports += 1.5
+        comp_to_mv.rotate_vecs(port_of_comp.orientation, port_of_target.orientation, pnt=port_of_comp.pos)
         if flip:
             comp_to_mv.reflect(port_of_comp.pos, port_of_comp.orientation)
 
-        comp_to_mv.translate(port_of_target.pos)
+        comp_to_mv.rotate_around(port_of_comp.orientation, rotate_ang)
+
+        comp_to_mv.xyz_with_ports += port_of_target.pos
 
         if port_of_comp.anchor and port_of_target.anchor:
             self.add_bond([port_of_comp.anchor, port_of_target.anchor])
-            port_of_comp.parent.remove(port_of_comp)
-            port_of_target.parent.remove(port_of_target)
+        port_of_comp.parent.remove(port_of_comp)
+        port_of_target.parent.remove(port_of_target)
 
 
     def _create_equivalence_transform(self,equiv):
@@ -3045,7 +2879,6 @@ end structure
             for i in range(m_compound):
                 coords = tmp.xyz[i*comp.n_particles():(i+1)*comp.n_particles()]
                 _,out = self.neighbs(coords,initself.particles(), rcut=1.5)
-                # p=[x for x in p[0] if x not in tmp.particles()[i*comp.n_particles():(i+1)*comp.n_particles()]]
 
                 if not list(chain.from_iterable(out)):
                     cop = deepcopy(comp)
@@ -3163,7 +2996,7 @@ end structure
             f.write("\nthree bond intra regular kcal\n")
             for x in self.ff.atom_types:
                 f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]}  {2*float(x['k'])}  {x['angle']}\n")
-    def rotate(self, v1, v2, pnt=None):
+    def rotate_vecs(self, v1, v2, pnt=None):
         ''' rotates the particles according to the angle between v1 and v2'''
         v1, v2 = map(np.array, [v1, v2])
         v1, v2 = map(lambda x:x/norm(x), [v1, v2])
@@ -3174,8 +3007,19 @@ end structure
             return
         rot = R.from_rotvec(normal*angle_between_vecs(v1, v2, in_degrees=0)/norm(normal))
         self.xyz_with_ports = rot.apply(self.xyz_with_ports)
-        for x in self.particles_by_name('_p'):
+        for x in [x for x in self.particles(1) if '!' in x.name]:
             x.orientation = rot.apply(x.orientation)
+
+    def rotate_around(self, vec, ang, degrees=1):
+        vec = np.array(vec)
+        vec = vec/norm(vec)
+        if degrees:
+            ang = math.radians(ang)
+        rot = R.from_rotvec(vec*ang)
+        self.xyz_with_ports = rot.apply(self.xyz_with_ports)
+        for x in [x for x in self.particles(1) if '!' in x.name]:
+            x.orientation = rot.apply(x.orientation)
+
 
 
 class Box:
@@ -3259,18 +3103,13 @@ class Port(Compound):
     ----------
     anchor : mb.Particle, optional, default=None
         A Particle associated with the port. Used to form bonds.
-    orientation : array-like, shape=(3,), optional, default=[0, 1, 0]
+    orientation : array-like, shape=(3,)
         Vector along which to orient the port
-    separation : float, optional, default=0
-        Distance to shift port along the orientation vector from the anchor
-        particle position. If no anchor is provided, the port will be shifted
-        from the origin.
     anchor : mb.Particle, optional, default=None
         A Particle associated with the port. Used to form bonds.
-    type: up or down: decide whether to flip
 
     """
-    def __init__(self, anchor=None, orientation=[1, 0, 0], pos=[0, 0, 0], name='_p'):
+    def __init__(self, anchor=None, orientation=[1, 0, 0], pos=[0, 0, 0], name='p!'):
 
         orientation, loc_vec = map(np.asarray, [orientation, pos])
 

@@ -65,7 +65,7 @@ def alkane(n, num_caps=0):
     alk.add(deepcopy(ch2))
     for i in range(n-1):
         c_ch2 = deepcopy(ch2)
-        alk.force_overlap(c_ch2, c_ch2['_p'][0], alk[-1], flip=1)
+        alk.force_overlap(c_ch2, c_ch2['p!'][0], alk[-1], flip=1)
         alk.add(c_ch2)
 
     ch3 = Compound(names=['C', 'H', 'H', 'H'],
@@ -97,21 +97,17 @@ def dimer(nchain):
     c2, c1 = [6.3001, 4.1639, 6.0570], [8.5253, 8.0180, 6.0570]
 
     tmp1, tmp2 = c1 - sil['Si1'].pos, c2 - sil['Si2'].pos
-    sil.add(Port(sil['Si1'], loc_vec=tmp1, orientation=[0, 0, 1], name='c1'), expand=0)
-    sil.add(Port(sil['Si2'], loc_vec=tmp2, orientation=[0, 0, 1], name='c2'), expand=0)
+    sil.add(Port(sil['Si1'], pos=sil['Si1'].pos+tmp1/2, orientation=tmp1, name='p1!'), expand=0)
+    sil.add(Port(sil['Si2'], pos=sil['Si2'].pos+tmp2/2, orientation=tmp2, name='p2!'), expand=0)
 
     alksil.add(sil, expand=0)
     alkane = alkane(nchain)
-    alkane['port'][0].translate_to(alkane['C'][0].pos)  # translate port to carbon
-    alkane['port'][0].rotate(-90, [0, 0, 1])
-    # alkane.energy_minimize()
+    alk1, alk2 = deepcopy(alkane), deepcopy(alkane)
+    alksil.add([alk1, alk2], expand=0)
+    alksil.force_overlap(alk1, alk1['p!'][-1], sil['p1!'], flip=1, rotate_ang=90)
+    alksil.force_overlap(alk2, alk2['p!'][-1], sil['p2!'], flip=1, rotate_ang=90)
 
-    alksil.add(deepcopy(alkane), expand=0)
-    alksil.add(alkane, expand=0)
-
-    alksil.force_overlap(alksil['alkane'][0], alksil['alkane'][0]['port'][0], sil['c1'], flip=1)
-    alksil.force_overlap(alksil['alkane'][1], alksil['alkane'][1]['port'][0], sil['c2'], flip=1)
-    alksil.remove([x.parent for x in alksil.particles_by_name('_p')])
+    alksil.remove([x for x in alksil.particles(1) if '!' in x.name])
     return alksil
 
 def mod_com(commands, intervals, tt, opts, pstr: 'partial string', par_lst, par_lst2):
@@ -146,7 +142,8 @@ def get_lmps(configs, inp_fle='runfile'):
     lmps = []
     frc_lmps = np.empty(configs.shape, dtype=float)
     for i, pos in enumerate(configs):
-        lmp = lammps(cmdargs=['-echo', 'none', '-screen', 'none'])
+        # lmp = lammps(cmdargs=['-echo', 'none', '-screen', 'none'])
+        lmp = lammps()
         lmp.file(inp_fle)
         x = lmp.extract_atom("x", 3)
         for j, p in enumerate(pos):
