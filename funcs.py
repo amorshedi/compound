@@ -95,17 +95,18 @@ def dimer(nchain):
     sil = compload('/home/ali/ongoing_research/polymer4/22_lammps_py_fitting/sil.mol2', compound=Compound(name='sil'),
                    infer_hierarchy=0)  # type: Compound
     c2, c1 = [6.3001, 4.1639, 6.0570], [8.5253, 8.0180, 6.0570]
-
+    sil[['O3', 'Si2']]
     tmp1, tmp2 = c1 - sil['Si1'].pos, c2 - sil['Si2'].pos
-    sil.add(Port(sil['Si1'], pos=sil['Si1'].pos+tmp1/2, orientation=tmp1, name='p1!'), expand=0)
-    sil.add(Port(sil['Si2'], pos=sil['Si2'].pos+tmp2/2, orientation=tmp2, name='p2!'), expand=0)
+    sil.add(Port(sil['Si1'], pos=sil['Si1'].pos+tmp1/2, orientation=sil['Si2'].pos-sil['O3'].pos, name='p1!'), expand=0)
+    sil.add(Port(sil['Si2'], pos=sil['Si2'].pos+tmp2/2, orientation=sil['Si2'].pos-sil['O3'].pos, name='p2!'), expand=0)
 
     alksil.add(sil, expand=0)
     alkane = alkane(nchain)
+    alkane['p!'][-1].orientation = alkane['C'][-3].pos - alkane['C'][-1].pos
     alk1, alk2 = deepcopy(alkane), deepcopy(alkane)
     alksil.add([alk1, alk2], expand=0)
-    alksil.force_overlap(alk1, alk1['p!'][-1], sil['p1!'], flip=1, rotate_ang=90)
-    alksil.force_overlap(alk2, alk2['p!'][-1], sil['p2!'], flip=1, rotate_ang=90)
+    alksil.force_overlap(alk1, alk1['p!'][-1], sil['p1!'], rotate_ang=90)
+    alksil.force_overlap(alk2, alk2['p!'][-1], sil['p2!'], rotate_ang=90)
 
     alksil.remove([x for x in alksil.particles(1) if '!' in x.name])
     return alksil

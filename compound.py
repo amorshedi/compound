@@ -473,6 +473,8 @@ class Compound(object):
         """
         # Preprocessing and validating input type
         if not hasattr(objs_to_remove, '__iter__'):
+            if objs_to_remove not in self:
+                return
             objs_to_remove = [objs_to_remove]
         objs_to_remove = set(objs_to_remove)
 
@@ -674,6 +676,8 @@ class Compound(object):
 
         if mol2:
             self.save('out.mol2')
+            os.system(f'echo "pbc set {{{self.box.a} {self.box.b} {self.box.c} {self.box.alph} {self.box.bet} {self.box.gam}'
+                      f'}} -all" >> txt')
             os.system('/home/ali/software/vmd-1.9.4a43/bin2/vmd out.mol2 -e txt')
             os.system('rm out.mol2 txt')
         else:
@@ -2132,6 +2136,7 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             molecule_type.bonds.add(intermol_bond)
 
     def __getitem__(self, selection):
+
         if isinstance(selection, int):
             return self.children[selection]
         if isinstance(selection, str):
@@ -2142,6 +2147,11 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
                 return out[0]
             else:
                 return out
+        lst = []
+        if isinstance(selection, Iterable):
+            for x in selection:
+                lst.append(self.__getitem__(x))
+            return lst
 
     def __repr__(self):
         descr = list('<')
@@ -3095,6 +3105,29 @@ class Box:
         return self.yhi + np.max([0.0, self.yz])
 
     zlo_bound, zhi_bound = zlo, zhi
+
+    a = lx
+
+    @property
+    def b(self):
+        return norm(self.comp.latmat[1])
+
+    @property
+    def c(self):
+        return norm(self.comp.latmat[2])
+
+    @property
+    def alph(self):
+        return angle_between_vecs(self.comp.latmat[1], self.comp.latmat[2])
+
+    @property
+    def bet(self):
+        return angle_between_vecs(self.comp.latmat[0], self.comp.latmat[2])
+
+    @property
+    def gam(self):
+        return angle_between_vecs(self.comp.latmat[0], self.comp.latmat[1])
+
 
 class Port(Compound):
     """A set of four ghost Particles used to connect parts.
