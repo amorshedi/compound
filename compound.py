@@ -660,7 +660,7 @@ class Compound(object):
         return np.ctypeslib.as_array(lmps.extract_atom("x", 3).contents, shape=self.xyz.shape)
 
 
-    def vmd(self,ports=1,atoms=[],label_sorted=1, mol2=0):
+    def vmd(self,ports=1,atoms=[],label_sorted=1, mol2=0, types=0):
         """ see the system in vmd """
 
         os.system('>txt;# echo "mol new {out.lammpstrj} type {lammpstrj} first 0 last -1 step 1 waitfor -1" >> txt')
@@ -681,35 +681,29 @@ class Compound(object):
             os.system('/home/ali/software/vmd-1.9.4a43/bin2/vmd out.mol2 -e txt')
             os.system('rm out.mol2 txt')
         else:
-            self.write_lammpstrj(ports=ports,label_sorted=label_sorted)
+            self.write_lammpstrj(ports=ports,label_sorted=label_sorted, types=types)
             os.system('/home/ali/software/vmd-1.9.4a43/bin2/vmd out.lammpstrj -e txt')
             os.system('rm out.lammpstrj txt')
 
-    def write_lammpstrj(self, fle='out', unit_set='real',ports=1, label_sorted=1):
+    def write_lammpstrj(self, fle='out', unit_set='real',ports=1, label_sorted=1, types=0):
         """Write one or more frames of data to a lammpstrj file.
-
-        Parameters
-        ----------
-        unit_set : str, optional
-            The LAMMPS unit set that the simulation was performed in. See
-            http://lammps.sandia.gov/doc/units.html for options. Currently supported
-            unit sets: 'real'.
+           types: if the forcefield types were assigned
         """
         fle=open(fle+'.lammpstrj','w')
-        fle.write('''ITEM: TIMESTEP
-0
-ITEM: NUMBER OF ATOMS
-{}
-ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
-
-        fle.write('ITEM: BOX BOUNDS xy xz yz pp pp pp\n')
-        fle.write('{0} {1} {2}\n'.format(self.box.xlo_bound, self.box.xhi_bound, self.box.xy))
-        fle.write('{0} {1} {2}\n'.format(self.box.ylo_bound, self.box.yhi_bound, self.box.xz))
-        fle.write('{0} {1} {2}\n\n'.format(self.box.zlo_bound, self.box.zhi_bound, self.box.yz))
+        fle.write('ITEM: TIMESTEP\n'
+                  '0\n'
+                  'ITEM: NUMBER OF ATOMS\n'
+                  f'{self.n_particles(ports)}\n'
+                  'ITEM: BOX BOUNDS xy xz yz pp pp pp\n')
+        b = self.box
+        fle.write(f'{b.xlo_bound} {b.xhi_bound} {b.xy}\n'
+                  f'{b.ylo_bound} {b.yhi_bound} {b.xz}\n'
+                  f'{b.zlo_bound} {b.zhi_bound} {b.yz}\n\n')
         # --- begin body ---
         fle.write('ITEM: ATOMS element x y z\n')
         for part in self.particles_label_sorted(ports) if label_sorted else self.particles(ports):
-            fle.write('{} {} {} {}\n'.format(part.name,*part.pos.tolist()))
+            c = part.pos
+            fle.write(f"{part.type['name'] if types else part.name} {c[0]} {c[1]} {c[2]}\n")
 
 
     def write_poscar(self, path='.', lattice_const = 1,
@@ -796,10 +790,37 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
             particle_array = np.array(list(self.particles()))
         return particle_array[idxs]
 
-    def neighbs(self,set1,set2=None,rcut=2,slf=0):
+
+    def closest_img_angle(self, p1, p2, p3):
+        ''' input three particles, get back three coordinates '''
+        c0 = p1.pos
+        c1 = self.neighbs(c0, p2, closest_img=1)[0]
+        c2 = self.neighbs(c1, p3, closest_img=1)[0]
+        return c0, c1, c2
+
+
+    def closest_img_bond(self, p1, p2):
+        ''' input three particles, get back three coordinates '''
+        c0 = p1.pos
+        c1 = self.neighbs(c0, p2, closest_img=1)[0]
+        return c0, c1
+
+
+    def neighbs(self,set1,set2=None,rcut=2,slf=0, closest_img=0):
         ''' set1: either a list of atoms or a list of coordinates'''
-        set1, set2 = [set1] if isinstance(set1, Compound) else list(set1), list(set2) if set2 else self.particles()
-        if not set2:
+        if isinstance(set1, Iterable):  #this way to be able to handle generators coming for set1
+            set1 = list(set1)
+            if not isinstance(set1[0], Compound):
+                set1 = [set1]
+        else:
+            set1 = [set1]
+
+        if set2:
+            if isinstance(set2, Iterable):
+                set2 = list(set2)
+            else:
+                set2 = [set2]
+        else:
             set2 = self.particles()
 
         coords_set1 = np.vstack([x.xyz for x in set1]) if isinstance(set1[0], Compound) else set1
@@ -810,6 +831,8 @@ ITEM: BOX BOUNDS xy xz yz pp pp pp'''.format(self.n_particles(ports)))
         for cnt,coord in enumerate(coords_set1):
             r = (coord - coords_set2) @ inv(self.latmat)
             rfrac = r - np.round(r)
+            if closest_img:
+                return coord - rfrac @ self.latmat
             dists = norm(rfrac @ self.latmat,axis=1)
 
             tmp = dists<rcut
