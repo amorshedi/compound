@@ -1,13 +1,272 @@
 import numpy as np
 import os, re, subprocess, math, io
 from lammps import lammps
+from numpy import dot, cross, sqrt, einsum
 from numpy.linalg import norm, svd
 from math import degrees, radians
 from collections.abc import Iterable
 from parmed import unit as u
+from subprocess import check_output
+from molmod.ic import bond_length, bend_angle, dihed_angle
+
 # from lib.recipes.alkane import Alkane
 # from compound import Compound, compload, Port
 from copy import deepcopy
+
+def dihed_derivs2(p1,p2,p3,p4):
+    def zet(s):
+        return (s[0]==s[1]) - (s[0]==s[2])
+
+    u = p1 - p2
+    w = p3 - p2
+    v = p4 - p3
+    nu,nv,nw = np.array([norm(x) for x in [u,v,w]])
+    u,v,w = u/nu, v/nv, w/nw
+
+    cphi_u = dot(u,w)
+    sphi_u = sqrt(1-cphi_u**2)
+    cphi_v = -dot(v,w)
+    sphi_v = sqrt(1-cphi_v**2)
+    cuw = cross(u,w)
+    cvw = cross(v,w)
+
+    sphi_u4 = sphi_u**4
+    sphi_v4 = sphi_v**4
+
+    t1 = einsum('i,j', cuw, w*cphi_u-u)
+    e1 = (t1 + t1.T)/sphi_u4/nu**2
+
+    t2 = einsum('i,j', cvw, w*cphi_v-v)
+    e2 = (t2+t2.T)/sphi_v4/nv**2
+
+    t3 = einsum('i,j', cuw, w - 2*u*cphi_u + w*cphi_u**2)
+    e3 = (t3+t3.T)/sphi_u4/2/nu/nw
+
+    t4 = einsum('i,j', cvw, w + 2*u*cphi_v + w*cphi_v**2)
+    e4 = (t4+t4.T)/sphi_v4/2/nv/nw
+
+    t5 = einsum('i,j', cuw, u + u*cphi_u**2 - 3*w*cphi_u + w*cphi_u**3)
+    e5 = (t5+t5.T)/sphi_u4/2/nw**2
+
+    t6 = einsum('i,j', cvw, v + v*cphi_v**2 + 3*w*cphi_v - w*cphi_v**3)
+    e6 = (t6+t6.T)/sphi_v4/2/nw**2
+    
+    e7 = np.zeros([3,3])
+    e8 = deepcopy(e7)
+    for i in range(3):
+        for j in [x for x in range(3) if x!=i]:
+            k = [x for x in range(3) if x not in [i,j]][0]
+            e7[i,j] = (j-i) * (-1/2)**np.abs(j-i) * (w[k]*cphi_u - u[k])/nu/nw/sphi_u
+            e8[i,j] = (j-i) * (-1/2)**np.abs(j-i) * (w[k]*cphi_v - v[k])/nv/nw/sphi_v
+
+    val = np.zeros([12,12])
+    for cnt1,a in enumerate('mopn'):
+        for cnt2,b in enumerate('mopn'):
+           val[3*cnt1:3*(cnt1+1),3*cnt2:3*(cnt2+1)] = \
+            zet(a+'mo')*zet(b+'mo')*e1 + zet(a+'np')*zet(b+'np')*e2+\
+            (zet(a+'mo')*zet(b+'op') + zet(a+'po')*zet(b+'om'))*e3 +\
+            (zet(a+'np')*zet(b+'po') + zet(a+'po')*zet(b+'np'))*e4+\
+            zet(a+'op')*zet(b+'po')*e5+\
+            zet(a+'op')*zet(b+'op')*e6+\
+                  (1- (a==b))*(zet(a+'mo')*zet(b+'op') + zet(a+'po')*zet(b+'om'))*e7+\
+                  (1- (a==b))*(zet(a+'no')*zet(b+'op') + zet(a+'po')*zet(b+'om'))*e8
+    return val
+
+
+def analytic_hessian(comp):
+    nlst = comp.particles_label_sorted()
+    n = len(nlst)
+    hessian = np.zeros([3*n,3*n])
+    qlist = [*comp.bonds_typed, *comp.angles_typed, *comp.propers_typed]
+    tjac = np.zeros([len(qlist), 3*comp.n_particles()])
+    for cnt, x in enumerate(qlist):
+        idx = []
+        for v in x:
+            tmp = nlst.index(v)
+            idx.extend([3*tmp, 3*tmp+1, 3*tmp+2])
+        # idx = np.sort(idx)
+        if len(x) == 2:
+            fun = bond_length
+            k = comp.bonds_typed[x]['k']
+            eq = float(comp.bonds_typed[x]['length'])
+        elif len(x) == 3:
+            fun = bend_angle
+            k = comp.angles_typed[x]['k']
+            eq = math.radians(float(comp.angles_typed[x]['angle']))
+        else:
+            fun = dihed_angle
+            k = comp.propers_typed[x]['k']
+            eq = math.radians(float(comp.propers_typed[x]['phi']))
+            k = float(k)/2
+            # mag2, fderiv2, sderiv2 = dihed_derivs(*[v.pos for v in x])
+            # sderiv3 = dihed_derivs2(*[v.pos for v in x])
+        k = float(k)
+        #
+        mag, fderiv, sderiv = fun([v.pos for v in x], 2)
+        if mag < 0:
+            mag *= -1
+            sderiv *= -1
+        sderiv = sderiv.reshape([-1, 3*len(x)])
+        fderiv = fderiv.flatten()
+        hessian[np.ix_(idx, idx)] += 2 * k * (np.einsum('i,j', fderiv, fderiv) + (mag - eq) * sderiv)
+    return hessian
+
+def gulp_hessian(comp, direc='gulp.out'):
+    '''extract hessian from gulp output'''
+    n = comp.n_particles()*3
+    dyn_mat = check_output('''awk '/Real Dynamical/{getline;getline;flg=1}NF<2{flg=0}flg' '''+direc, shell=1)
+    dyn_mat = np.array(dyn_mat.decode('utf-8').split(), dtype=float)[-n*n:].reshape([n, -1])
+    
+    hessian = np.zeros([n, n])
+    parts = comp.particles_label_sorted()
+    masses = np.repeat(np.array([x.type['mass'] for x in parts], dtype=float), 3)
+    for i in range(n):
+        for j in range(n):
+            hessian[i, j] = np.sqrt(masses[i]*masses[j]) * dyn_mat[i, j]
+    return ev_to_kcalpmol(hessian)._value
+
+def hessian_to_dynmat(comp, hess):
+    '''multiply by 1/sqrt(m_im_j)'''
+    n = comp.n_particles() * 3
+    dynmat = np.zeros([n, n])
+    parts = comp.particles_label_sorted()
+    masses = np.repeat(np.array([x.type['mass'] for x in parts], dtype=float), 3)
+    for i in range(n):
+        for j in range(n):
+            dynmat[i, j] = 1/np.sqrt(masses[i] * masses[j]) * hess[i, j]
+    return dynmat
+
+def bond_derivs(rs, deriv=1):
+    ''' seeing bond length as generalized coordinate, this gives dq/dx_i or d^2q/dx_i*dx_j'''
+    rs = np.array(rs)
+    del_r = rs[0] - rs[1]
+    ndr = norm(del_r)
+    ndrv = del_r/ndr #normalized dr vector
+    if deriv == 1:
+        return np.vstack([ndrv, -ndrv])
+
+    hessian = np.zeros([6, 6])
+    if deriv == 2:
+        tmp = (np.outer(ndrv, ndrv) - np.eye(3))/ndr
+        for i in range(2):
+            for j in range(2):
+                hessian[3*i:3*(i+1), 3*j:3*(j+1)] = (-1)**(i == j) * tmp
+        return hessian
+
+def dihed_derivs(p1,p2,p3,p4,d='dum'):
+    '''from Karplus' paper'''
+    p1,p2,p3,p4 = map(np.array,[p1,p2,p3,p4])
+
+    F = p1 - p2
+    G = p2 - p3
+    H = p4 - p3
+    A = np.cross(F, G)
+    B = np.cross(H, G)
+
+    phi = np.arccos(dot(A,B)/norm(A)/norm(B))
+
+    nG = norm(G); nB = norm(B)
+    nAsq = norm(A)**2
+    nBsq = norm(B)**2
+
+    dfg = dot(F,G)
+    dhg = dot(H,G)
+    dfg = dot(F,G)
+
+    dphi_dr1 = -nG/nAsq*A
+    dphi_dr2 = nG/nAsq*A + dfg/nAsq/nG*A - dhg/nBsq/nG*B
+    dphi_dr3 = dhg/nBsq/nG*B - dfg/nAsq/nG*A - nG/nBsq*B
+    dphi_dr4 = nG/nBsq*B
+
+    dphi_dr = np.array([*dphi_dr1, *dphi_dr2, *dphi_dr3, *dphi_dr4])
+
+    s1 = range(0,3); s2 = range(3,6); s3 = range(6,9);
+
+    dT_dr=np.array([[1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, -1, 0, 0, 1, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 1, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 1]])
+    d2phi_dT2 = np.zeros([9, 9])
+    cga = cross(G,A)
+    cfa = cross(F,A)
+    chb = cross(H,B)
+    cgb = cross(G,B)
+    t1 = np.einsum('i,j', A, cga) + np.einsum('i,j', cga,A)
+    t2 = np.einsum('i,j', A, cfa) + np.einsum('i,j', cfa,A)
+    t3 = np.einsum('i,j', B, cgb) + np.einsum('i,j', cgb,B)
+    t4 = np.einsum('i,j', B, chb) + np.einsum('i,j', chb,B)
+
+    d2phi_dT2[np.ix_(s1, s1)] = nG/nAsq**2*t1 #eq 32
+
+    d2phi_dT2[np.ix_(s2, s2)] = 1/2/nG**3/nAsq*t1 + dfg/nG/nAsq**2*t2 -  1/2/nG**3/nB**2*t3 - dhg/nG/nB**4*t4 #eq 44
+
+    d2phi_dT2[np.ix_(s3, s3)] = -nG/nBsq**2*t3 #eq 33
+
+    d2phi_dT2[np.ix_(s1, s2)] = -1/nG/nAsq**2*(nG**2*np.einsum('i,j', cfa, A) + dfg*np.einsum('i,j', A, cga)) #eq 38
+    d2phi_dT2[np.ix_(s2, s1)] = d2phi_dT2[np.ix_(s1, s2)]
+
+    d2phi_dT2[np.ix_(s2, s3)] = 1/nG/nBsq**2*(nG**2*np.einsum('i,j', chb, B) + dhg*np.einsum('i,j', B, cgb)) #eq 39
+    d2phi_dT2[np.ix_(s3, s2)] = d2phi_dT2[np.ix_(s2, s3)]
+
+    # kk = np.zeros([12,12])
+    # for i in range(12):
+    #     for j in range(12):
+    #         tmp = 0
+    #         for k in range(9):
+    #             for l in range(9):
+    #                 tmp += dT_dr[k, i]*dT_dr[l, j]*d2phi_dT2[k, l]
+    #         kk[i, j] = tmp
+    tmp = np.einsum('ij,kl', dT_dr, dT_dr)
+    return phi, dphi_dr, np.einsum('ij,ikjl',d2phi_dT2,tmp)
+
+def gulp_out_coords(direc='gulp.out'):
+    coords = check_output('''awk '/Final fractional/{for (i=0;i<6;i++) getline; flg=1}/---/{flg=0}flg{print $4, $5, $6}' '''+direc, shell=1)
+    lat = check_output('''awk '/Cartesian lattice/{getline;getline; for (i=0;i<3;i++) {print;getline}}' '''+direc, shell=1)
+
+    return np.genfromtxt(io.BytesIO(coords)) @ np.genfromtxt(io.BytesIO(lat))
+
+def plane_normal(p1, p2, p3):
+    ''' normal to plane from three points '''
+    p1, p2, p3 = map(np.array, [p1, p2, p3])
+    v1 = p1 - p2
+    v2 = p3 - p2
+    vec = np.cross(v1, v2)
+    return vec/norm(vec)
+
+
+def ab_to_es(A, B, reverse=0):
+    '''
+  #          A       B                            /  / s \^a    / s \^b \
+  #  U(r) = ---  -  ---           =       4 * e * |  |---|   -  |---|   |
+  #         r^a     r^b                           \  \ r /      \ r /   /
+
+  #    A =  4*e*s^a
+  #    B = -4*e*s^b
+
+  For A,B>0:
+  #    s = (A/B)^(1/(a-b))
+  #    e = -B / (4*s^b)
+  #  Setting B=0.0001, and A=1.0   (for sigma=2^(-1/6))
+  #  ---> e=2.5e-09, s=4.641588833612778
+  #  This is good enough for us.  (The well depth is 2.5e-9 which is almost 0)'''
+    if reverse:
+        e, s = A, B
+        A = 4*e*s**12
+        B = 4*e*s**6
+    else:
+        s = (A/B)**(1/6)
+        e = B/(4*s**6)
+
+    return (A, B) if reverse else (e, s)
+
+def get_2d_arr(inpstr):
+    aa = inpstr.split('\n')
+    return np.array([x.split() for x in aa], dtype=float)
 
 def flatten(l):
     for el in l:
@@ -82,7 +341,7 @@ def alkane(n, num_caps=0):
     for i in range(num_caps):
         cp = deepcopy(ch3)
         alk.add(cp)
-        alk.force_overlap(cp, cp['_p'], alk['_p'][-2], flip=0)
+        alk.force_overlap(cp, cp['p!'], alk['p!'][-2], flip=0)
 
 
     return alk
@@ -155,9 +414,10 @@ def get_lmps(configs, inp_fle='runfile'):
         frc_lmps[i] = np.ctypeslib.as_array(lmp.extract_atom("f", 3).contents, shape=configs[0].shape)
     return lmps[0] if len(lmps)==1 else lmps, frc_lmps
 
-def ev_to_kcalpmol(input):
+def ev_to_kcalpmol(input, reverse=0):
     from parmed import unit as u
-    return u.AVOGADRO_CONSTANT_NA._value * (
+    return u.AVOGADRO_CONSTANT_NA._value**-1 * (
+		input * u.kilocalorie).in_units_of(u.elementary_charge * u.volts) if reverse else u.AVOGADRO_CONSTANT_NA._value * (
 		input * u.elementary_charge * u.volts).in_units_of(u.kilocalorie)
 
 def get_file_num(outdir):
@@ -172,9 +432,9 @@ def coords_forces_from_outcar(direc, save_npy=0):
     '''direc: outcar directory
        nump: number of particles'''
 
-    n = subprocess.check_output(f' grep -oP -m 1 \'(?<=NIONS =)\\s*[0-9]*\' {os.path.join(direc,"OUTCAR")} ', shell=1)
+    n = check_output(f' grep -oP -m 1 \'(?<=NIONS =)\\s*[0-9]*\' {os.path.join(direc,"OUTCAR")} ', shell=1)
     n = int(n.decode('utf-8'))
-    dft_pos_frc = subprocess.check_output(
+    dft_pos_frc = check_output(
         f'''awk '/TOTAL-/{{getline;getline;flg=1}};/--/{{flg=0}}flg{{print $1, $2, $3, $4, $5, $6}}' {direc}/OUTCAR ''', shell=1)
     dft_pos_frc = np.vstack([np.fromstring(x, np.float, sep=' ')
                         for x in dft_pos_frc.decode('utf-8').split('\n')[:-1]])
@@ -203,9 +463,9 @@ def cut_array2d(array, shape):
     return blocks
 
 def get_vasp_hessian(direc):
-    n = subprocess.check_output(f' grep -oP -m 1 \'(?<=NIONS =)\\s*[0-9]*\' {os.path.join(direc,"OUTCAR")} ', shell=1)
+    n = check_output(f' grep -oP -m 1 \'(?<=NIONS =)\\s*[0-9]*\' {os.path.join(direc,"OUTCAR")} ', shell=1)
     n = int(n.decode('utf-8'))
-    hessian = subprocess.check_output(
+    hessian = check_output(
         f''' awk '/^  1X/{{flg=1}};/^ Eigen/{{flg=0}}flg{{$1="";print $0}}' {direc}/OUTCAR ''',
         shell=1)
     return (u.AVOGADRO_CONSTANT_NA._value *(np.genfromtxt(io.BytesIO(hessian)) *
@@ -238,6 +498,7 @@ def equivalence_classes(objects, func):
         objects = [x for x in objects if x not in eq_class]
     return out
 
+
 def find_file(name, paths):
     results = []
     for path in paths:
@@ -250,18 +511,18 @@ def get_vasp_freqs(direc):
     ''' units of output (each column): THz - 2PiTHz - cm-1  - meV'''
 
     command = f"awk '/2PiTHz/{{if (\"f\"==$2) {{print $4, $6, $8, $10}} else {{print $3, $5, $7, $9}}}}' {os.path.join(direc,'')}OUTCAR"
-    file = subprocess.check_output(command, shell=1)
+    file = check_output(command, shell=1)
     return np.genfromtxt(io.BytesIO(file))
 
 def get_gulp_freqs(direc):
     command = f"awk '/Frequencies/{{getline;getline;flg=1}};NF==0&&flg{{print \"sep\";flg=0}};flg' {direc}"
-    file = subprocess.check_output(command, shell=1).decode('utf-8').split('sep')[-2].replace('\n',' ')
+    file = check_output(command, shell=1).decode('utf-8').split('sep')[-2].replace('\n',' ')
     return np.fromstring(file, sep=' ')
 
-def angle_between_vecs(v1, v2, in_degrees=1):
+def angle_between_vecs(v1, v2, degrees=1):
     v1, v2 = map(np.array,[v1, v2])
     ang = np.arccos(v1 @ v2/(norm(v1) * norm(v2)))
 
-    return degrees(ang) if in_degrees else ang
+    return np.degrees(ang) if degrees else ang
 
 
