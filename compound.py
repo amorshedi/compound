@@ -14,18 +14,15 @@ from parmed.periodic_table import AtomicNum, element_by_name, Mass, Element
 from funcs import angle_between_vecs, transform_mat, apply_transform, get_lmps, equivalence_classes
 from openbabel import pybel,openbabel
 import networkx as nx
-# from os import system as syst
-#
-# # from openbabel import openbabel as ob
-# # from openbabel import pybel as pb
-# from pymatgen.util.coord import pbc_shortest_vectors, get_angle
+from molmod.ic import bond_length, bend_angle, dihed_angle
+
 from pymatgen.core import Structure
 #
 # import mdtraj.geometry as geom
 # from pymatgen import Lattice, Structure
 # # from openbabel import pybel
 #
-from numpy.linalg import inv, norm, det
+from numpy.linalg import inv, norm, det, matrix_rank
 # from coordinate_transform import _translate, _rotate,AxisTransform,RigidTransform, unit_vector, angle
 # from collections import defaultdict
 from orderedset import OrderedSet
@@ -409,6 +406,44 @@ class Compound(object):
         if parent is None:
             return self
         return parent
+
+    def analytic_hessian(self, qlist=None):
+        nlst = self.particles_label_sorted()
+        n = len(nlst)
+        hessian = np.zeros([3 * n, 3 * n])
+        qlist = qlist if qlist else [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
+        tjac = np.zeros([len(qlist), 3 * self.n_particles()])
+        for cnt, x in enumerate(qlist):
+            idx = []
+            for v in x:
+                tmp = nlst.index(v)
+                idx.extend([3 * tmp, 3 * tmp + 1, 3 * tmp + 2])
+            # idx = np.sort(idx)
+            if len(x) == 2:
+                fun, img = bond_length, self.closest_img_bond
+                k = self.bonds_typed[x]['k']
+                eq = float(self.bonds_typed[x]['length'])
+            elif len(x) == 3:
+                fun, img = bend_angle, self.closest_img_angle
+                k = self.angles_typed[x]['k']
+                eq = math.radians(float(self.angles_typed[x]['angle']))
+            else:
+                fun, img = dihed_angle, self.closest_img_dihed
+                k = self.propers_typed[x]['k']
+                eq = math.radians(float(self.propers_typed[x]['phi']))
+                k = float(k) / 2
+                # mag2, fderiv2, sderiv2 = dihed_derivs(*[v.pos for v in x])
+                # sderiv3 = dihed_derivs2(*[v.pos for v in x])
+            k = float(k)
+            #
+            mag, fderiv, sderiv = fun(img(*x), 2)
+            if mag < 0:
+                mag *= -1
+                sderiv *= -1
+            sderiv = sderiv.reshape([-1, 3 * len(x)])
+            fderiv = fderiv.flatten()
+            hessian[np.ix_(idx, idx)] += 2 * k * (np.einsum('i,j', fderiv, fderiv) + (mag - eq) * sderiv)
+        return hessian
 
     def particles_by_name(self, name):
         """Return all Particles of the Compound with a specific name
@@ -811,20 +846,23 @@ class Compound(object):
             particle_array = np.array(list(self.particles()))
         return particle_array[idxs]
 
-
-    def closest_img_angle(self, p1, p2, p3):
-        ''' input three particles, get back three coordinates '''
-        c0 = p1.pos
-        c1 = self.neighbs(c0, p2, closest_img=1)[0]
-        c2 = self.neighbs(c1, p3, closest_img=1)[0]
-        return c0, c1, c2
-
-
     def closest_img_bond(self, p1, p2):
-        ''' input three particles, get back three coordinates '''
+        ''' input two particles, get back two coordinates '''
         c0 = p1.pos
         c1 = self.neighbs(c0, p2, closest_img=1)[0]
         return c0, c1
+
+    def closest_img_angle(self, p1, p2, p3):
+        ''' input three particles, get back three coordinates '''
+        c1, c2 = self.closest_img_bond(p1, p2)
+        c3 = self.neighbs(c2, p3, closest_img=1)[0]
+        return c1, c2, c3
+
+    def closest_img_dihed(self, p1, p2, p3, p4):
+        ''' input three particles, get back three coordinates '''
+        c1, c2, c3 = self.closest_img_angle(p1, p2, p3)
+        c4 = self.neighbs(c3, p4, closest_img=1)[0]
+        return c1, c2, c3, c4
 
 
     def closest_img(self, atom, atoms):
@@ -1545,7 +1583,10 @@ class Compound(object):
                 if x[1] is not p:
                     self.bond_graph.remove_edge(*x)
                     self.bond_graph.add_edge(x[0], p)
+            self.gen_angs_and_diheds()
+
         self.wrap_atoms()
+
 
 
     @property
@@ -2582,21 +2623,9 @@ class Compound(object):
             return False
         elif atom_id.data == 'matches_string':
             raise NotImplementedError('matches_string is not yet implemented')
-        
-    
-    def create_bonding_all(self):
-        # from lxml.etree import Element, SubElement, Comment, tostring, ElementTree
-        import pymatgen.core.periodic_table as pt
-        # ff = ElementTree(element=Element('ForceField'))
-        types = equivalence_classes(self.particles_label_sorted(), lambda x,y: x.name==y.name)
-        # atom_type = SubElement(ff.getroot(), 'AtomTypes')
-        for x in types:
-            mass = pt.Element(x[0].name).atomic_mass
-            for i, atom in enumerate(x, 1):
-                nme = atom.name+str(i)
-                atom.type = {'name':nme, 'mass':str(mass), 'element':atom.name}
 
-        # create angles and dihedrals
+    def network_b_a_d(self):
+         # create angles and dihedrals
         nlst = list(self.particles(0))
         angles = OrderedSet()
         propers = OrderedSet()
@@ -2608,26 +2637,99 @@ class Compound(object):
                         angles.add(tuple([x for x in ipath]))
                     elif len(ipath) == 4:
                         propers.add(tuple([x for x in ipath]))
+        return self.bond_graph.edges, angles, propers
+    
+    def create_bonding_all(self):
+        import pymatgen.core.periodic_table as pt
+        # ff = ElementTree(element=Element('ForceField'))
+        types = equivalence_classes(self.particles_label_sorted(), lambda x,y: x.name==y.name)
+        # atom_type = SubElement(ff.getroot(), 'AtomTypes')
+        self.ff = FF()
+        # aa = [[ 89.  , 227.03], [ 47.  , 107.87], [ 13.  ,  26.98], [ 95.  , 243.  ], [ 18.  ,  39.95], [ 33.  ,  74.92], [ 85.  , 210.  ], [ 79.  , 196.97], [  5.  ,  10.81], [ 56.  , 137.33], [  4.  ,   9.01], [ 83.  , 208.98], [ 97.  , 247.  ], [ 35.  ,  79.9 ], [  6.  ,  12.01], [ 20.  ,  40.08], [ 48.  , 112.41], [ 58.  , 140.12], [ 98.  , 251.  ], [ 17.  ,  35.45], [ 96.  , 247.  ], [ 27.  ,  58.93], [ 24.  ,  52.  ], [ 55.  , 132.91], [ 29.  ,  63.55], [ 66.  , 162.5 ], [ 68.  , 167.26], [ 99.  , 252.  ], [ 63.  , 151.97], [  9.  ,  19.  ], [ 26.  ,  55.85], [100.  , 257.  ], [ 87.  , 223.  ], [ 31.  ,  69.72], [ 64.  , 157.25], [ 32.  ,  72.61], [  1.  ,   1.01], [105.  , 260.  ], [  2.  ,   4.  ], [ 72.  , 178.49], [ 80.  , 200.59], [ 67.  , 164.93], [ 53.  , 126.91], [ 49.  , 114.82], [ 77.  , 192.22], [ 19.  ,  39.1 ], [ 36.  ,  83.8 ], [ 57.  , 138.91], [  3.  ,   6.94], [103.  , 260.  ], [ 71.  , 174.97], [101.  , 258.  ], [ 12.  ,  24.31], [ 25.  ,  54.94], [ 42.  ,  95.94], [  7.  ,  14.01], [ 11.  ,  22.99], [ 41.  ,  92.91], [ 60.  , 144.24], [ 10.  ,  20.18], [ 28.  ,  58.69], [102.  , 259.  ], [ 93.  , 237.05], [  8.  ,  16.  ], [ 76.  , 190.2 ], [ 15.  ,  30.97], [ 91.  , 231.04], [ 82.  , 207.2 ], [ 46.  , 106.42], [ 61.  , 145.  ], [ 84.  , 209.  ], [ 59.  , 140.91], [ 78.  , 195.08], [ 94.  , 244.  ], [ 88.  , 226.03], [ 37.  ,  85.47], [ 75.  , 186.21], [104.  , 261.  ], [ 45.  , 102.91], [ 86.  , 222.  ], [ 44.  , 101.07], [ 16.  ,  32.07], [ 51.  , 121.75], [ 21.  ,  44.96], [ 34.  ,  78.96], [ 14.  ,  28.09], [ 62.  , 150.36], [ 50.  , 118.71], [ 38.  ,  87.62], [ 73.  , 180.95], [ 65.  , 158.93], [ 43.  ,  98.  ], [ 52.  , 127.6 ], [ 90.  , 232.04], [ 22.  ,  47.88], [ 81.  , 204.38], [ 69.  , 168.93], [ 92.  , 238.03], [ 23.  ,  50.94], [ 74.  , 183.85], [ 54.  , 131.29], [ 39.  ,  88.91], [ 70.  , 173.04], [ 30.  ,  65.39], [ 40.  ,  91.22], [106.  ,   2.01]]
+        # aa = {x[0]:x[1] for x in aa}
+        for x in types:
+            mass = pt.Element(x[0].name).atomic_mass
+            for i, atom in enumerate(x, 1):
+                nme = atom.name+str(i)
+                atom.type = {'name':nme, 'mass':str(mass.real), 'element':atom.name}
+                self.ff.atom_types.append(atom.type)
 
-        for x in self.bond_graph.edges:
-            self.
-
-        self.nonbond_typed = OrderedDict()
         self.bonds_typed = OrderedDict()
         self.angles_typed = OrderedDict()
         self.propers_typed = OrderedDict()
 
-        for p in self.particles():
-            for nb_type in self.ff.nonbond_types:
-                if p.type['name'] == nb_type['type']:
-                    self.nonbond_typed[p] = nb_type
-                    break
+        bonds, angles, propers = self.network_b_a_d()
 
-        for b in self.bond_graph.edges:
-            for btype in self.ff.bond_types:
-                if {x.type['name'] for x in b} == {btype[x] for x in ['type1','type2']}:
-                    self.bonds_typed[b] = btype
+        for x in bonds:
+            # if cnt==1:
+            mag = bond_length(self.closest_img_bond(*x), 0)
+            self.ff.bond_types.append({'k':" 344.65772", 'length':str(mag[0]), 'type1':x[0].type['name'], 'type2':x[1].type['name']})
+            self.bonds_typed[x] = self.ff.bond_types[-1]
+            # cnt += 1
 
+        for x in angles:
+            mag = bend_angle(self.closest_img_angle(*x), 0)
+            self.ff.angle_types.append({'k':" 50", 'angle':str(math.degrees(mag[0])), 'type1':x[0].type['name'], 'type2':x[1].type['name'], 'type3':x[2].type['name']})
+            self.angles_typed[x] = self.ff.angle_types[-1]
+
+        for x in propers:
+            mag = dihed_angle(self.closest_img_dihed(*x), 0)
+            self.ff.proper_types.append({'k':" 50", 'phi':str(math.degrees(abs(mag[0]))), 'type1':x[0].type['name'],
+                                        'type2':x[1].type['name'], 'type3':x[2].type['name'], 'type4':x[3].type['name']})
+            self.propers_typed[x] = self.ff.proper_types[-1]
+
+
+    def rm_redun_cons(self):
+        '''remove redundant connections. Note that we assume here that #of cons=# of con types for b/a/d'''
+        nlst = self.particles_label_sorted()
+        n = self.n_particles()
+        qlist = [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
+        B=[]
+        angles, diheds = [], []
+        for cnt, x in enumerate(qlist):
+            idx = []
+            for v in x:
+                tmp = nlst.index(v)
+                idx.extend([3 * tmp, 3 * tmp + 1, 3 * tmp + 2])
+            jac = np.zeros(3*n)
+            if len(x) == 2:
+                fun = bond_length
+            elif len(x) == 3:
+                fun = bend_angle
+            else:
+                fun = dihed_angle
+            _, tmp = fun([v.pos for v in x], 1)
+            jac[idx] = tmp.flatten()
+
+            if matrix_rank([*B, jac]) == len(B) + 1:
+                B.append(jac)
+            else:
+                if len(x) == 2:
+                    raise Exception('bonds are not independent')
+                elif len(x) == 3:
+                    self.ff.angle_types.remove(self.angles_typed[x])
+                    self.angles_typed.pop(x)
+                else:
+                    self.ff.proper_types.remove(self.propers_typed[x])
+                    self.propers_typed.pop(x)
+
+    def gen_angs_and_diheds(self):
+        angles = OrderedSet()
+        propers = OrderedSet()
+        nlst = list(self.particles(0))
+        for i, part1 in enumerate(nlst):
+            for part2 in nlst[i+1:]:
+                try:
+                    tmp = nx.all_simple_paths(self.bond_graph, part1, part2, 4) # type: list
+                except nx.exception.NodeNotFound:
+                    continue
+                for ipath in list(tmp):
+                    if len(ipath) == 3:
+                        angles.add(tuple([x for x in ipath]))
+                    elif len(ipath) == 4:
+                        propers.add(tuple([x for x in ipath]))
+        self.angles_typed = OrderedDict()
+        self.propers_typed = OrderedDict()
         for a in angles:
             for atype in self.ff.angle_types:
                 vals = [atype[f'type{i}'] for i in range(1,4)]
@@ -2639,12 +2741,6 @@ class Compound(object):
                 vals = [ptype[f'type{i}'] for i in range(1, 5)]
                 if [x.type['name'] for x in p] in (vals, vals[::-1]):
                     self.propers_typed[p] = ptype
-
-        ff.write('test.xml', pretty_print=1)
-        breakpoint()
-
-        
-
 
     def applyff(self,file):
         from foyer.forcefield import Forcefield
@@ -2683,21 +2779,10 @@ class Compound(object):
             x.type = x.type[0]
 
         # create angles and dihedrals
-        angles = OrderedSet()
-        propers = OrderedSet()
-        for i, part1 in enumerate(nlst):
-            for part2 in nlst[i+1:]:
-                tmp = nx.all_simple_paths(self.bond_graph, part1, part2, 4) # type: list
-                for ipath in list(tmp):
-                    if len(ipath) == 3:
-                        angles.add(tuple([x for x in ipath]))
-                    elif len(ipath) == 4:
-                        propers.add(tuple([x for x in ipath]))
+        self.gen_angs_and_diheds()
 
         self.nonbond_typed = OrderedDict()
         self.bonds_typed = OrderedDict()
-        self.angles_typed = OrderedDict()
-        self.propers_typed = OrderedDict()
 
         for p in self.particles():
             for nb_type in self.ff.nonbond_types:
@@ -2709,18 +2794,6 @@ class Compound(object):
             for btype in self.ff.bond_types:
                 if {x.type['name'] for x in b} == {btype[x] for x in ['type1','type2']}:
                     self.bonds_typed[b] = btype
-
-        for a in angles:
-            for atype in self.ff.angle_types:
-                vals = [atype[f'type{i}'] for i in range(1,4)]
-                if [x.type['name'] for x in a] in (vals,vals[::-1]):
-                    self.angles_typed[a] = atype
-
-        for p in propers:
-            for ptype in self.ff.proper_types:
-                vals = [ptype[f'type{i}'] for i in range(1, 5)]
-                if [x.type['name'] for x in p] in (vals, vals[::-1]):
-                    self.propers_typed[p] = ptype
 
     def write_lammpsdata(self, filename='data.dat', lj=1, elec=1, bond=1, angle=1, prop=1, atom_style='full',
                         unit_style='real', buff=0):
@@ -3143,7 +3216,10 @@ end structure
                 type_map[y['name']] = y['element']+str(i)
         with open(os.path.join(direc, 'gulp.in'), 'w') as f:
             f.write(keys)
-            f.write('\nelement \n mass C 12.011150\n mass H 1.07970\n end \n\nvector\n')
+            f.write('\n\nelement\n')
+            for x in types:
+                f.write(f"mass {x[0]['element']} {x[0]['mass']}\n")
+            f.write("end \n\nvector\n")
             f.write((3*(3*'{} '+'\n')).format(*self.latmat.flatten()))
             
             f.write('\ncart\n')
@@ -3326,7 +3402,7 @@ class FF():
     """
     def __init__(self):
         
-        self.atom_types,self.nonbond_types,self.bond_types,self.angle_types,self.proper_types = 5*[[]]
+        self.atom_types,self.nonbond_types,self.bond_types,self.angle_types,self.proper_types = [[], [], [], [], []]
         
     def read_xml(self, file):
         # start of my additions:

@@ -73,43 +73,12 @@ def dihed_derivs2(p1,p2,p3,p4):
     return val
 
 
-def analytic_hessian(comp):
-    nlst = comp.particles_label_sorted()
-    n = len(nlst)
-    hessian = np.zeros([3*n,3*n])
-    qlist = [*comp.bonds_typed, *comp.angles_typed, *comp.propers_typed]
-    tjac = np.zeros([len(qlist), 3*comp.n_particles()])
-    for cnt, x in enumerate(qlist):
-        idx = []
-        for v in x:
-            tmp = nlst.index(v)
-            idx.extend([3*tmp, 3*tmp+1, 3*tmp+2])
-        # idx = np.sort(idx)
-        if len(x) == 2:
-            fun = bond_length
-            k = comp.bonds_typed[x]['k']
-            eq = float(comp.bonds_typed[x]['length'])
-        elif len(x) == 3:
-            fun = bend_angle
-            k = comp.angles_typed[x]['k']
-            eq = math.radians(float(comp.angles_typed[x]['angle']))
-        else:
-            fun = dihed_angle
-            k = comp.propers_typed[x]['k']
-            eq = math.radians(float(comp.propers_typed[x]['phi']))
-            k = float(k)/2
-            # mag2, fderiv2, sderiv2 = dihed_derivs(*[v.pos for v in x])
-            # sderiv3 = dihed_derivs2(*[v.pos for v in x])
-        k = float(k)
-        #
-        mag, fderiv, sderiv = fun([v.pos for v in x], 2)
-        if mag < 0:
-            mag *= -1
-            sderiv *= -1
-        sderiv = sderiv.reshape([-1, 3*len(x)])
-        fderiv = fderiv.flatten()
-        hessian[np.ix_(idx, idx)] += 2 * k * (np.einsum('i,j', fderiv, fderiv) + (mag - eq) * sderiv)
-    return hessian
+def sub_list(lst, idx):
+    return [x for x in lst if lst.index(x) in idx]
+
+
+def mat_prt(mat, frm = '{:12.5f} '):
+    print(*[(len(x)*frm).format(*x) for x in mat], sep='\n')
 
 def gulp_hessian(comp, direc='gulp.out'):
     '''extract hessian from gulp output'''
@@ -337,7 +306,12 @@ def alkane(n, num_caps=0):
 
     dr = np.array([ 0.6252,  -0.6252,  -0.6252])/2
     ch3.add(Port(anchor=ch3['C'],pos=dr, orientation=-dr), expand=0)
-
+    if n == 0:
+        alk = Compound(name='alkane')
+        cp1, cp2 = deepcopy(ch3), deepcopy(ch3)
+        alk.add([cp1, cp2])
+        alk.force_overlap(cp1, cp1['p!'], cp2['p!'], flip=0)
+        return alk
     for i in range(num_caps):
         cp = deepcopy(ch3)
         alk.add(cp)
