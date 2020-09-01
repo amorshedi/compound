@@ -6,17 +6,17 @@ from copy import deepcopy
 import os, math#, sys, tempfile, importlib
 # from warnings import warn
 from itertools import chain, compress, combinations
-import mdtraj as md
-from mdtraj.core.element import get_by_symbol
+#
+#
 import parmed as pmd
 from scipy.spatial.transform import Rotation as R
 from parmed.periodic_table import AtomicNum, element_by_name, Mass, Element
-from funcs import angle_between_vecs, transform_mat, apply_transform, get_lmps, equivalence_classes
+from funcs import *
 from openbabel import pybel,openbabel
 import networkx as nx
 from molmod.ic import bond_length, bend_angle, dihed_angle
 
-from pymatgen.core import Structure
+# from pymatgen.core import Structure
 #
 # import mdtraj.geometry as geom
 # from pymatgen import Lattice, Structure
@@ -75,6 +75,8 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
     compound : mb.Compound
 
     """
+    import mdtraj as md
+    from pymatgen.core import Structure
     # If compound doesn't exist, we will initialize one
     if compound is None:
         compound = Compound()
@@ -222,10 +224,7 @@ def from_lmps_data(direc='data.dat'):
 class Compound(object):
     """A building block in the mbuild2 hierarchy.
 
-    Compound is the superclass of all composite building blocks in the mbuild2
-    hierarchy. That is, all composite building blocks must inherit from
-    compound, either directly or indirectly. The design of Compound follows the
-    Composite design pattern (Gamma, Erich; Richard Helm; Ralph Johnson; John
+    The design of Compound follows the Composite design pattern (Gamma, Erich; Richard Helm; Ralph Johnson; John
     M. Vlissides (1995). Design Patterns: Elements of Reusable Object-Oriented
     Software. Addison-Wesley. p. 395. ISBN 0-201-63361-2.), with Compound being
     the composite, and Particle playing the role of the primitive (leaf) part,
@@ -406,6 +405,12 @@ class Compound(object):
         if parent is None:
             return self
         return parent
+    
+    
+    def prt_bonding(self):
+        print('number of bonds: ', len(self.bonds_typed))
+        print('number of angles: ', len(self.angles_typed))
+        print('number of diheds: ', len(self.propers_typed), '\n')
 
     def analytic_hessian(self, qlist=None):
         nlst = self.particles_label_sorted()
@@ -427,21 +432,37 @@ class Compound(object):
                 fun, img = bend_angle, self.closest_img_angle
                 k = self.angles_typed[x]['k']
                 eq = math.radians(float(self.angles_typed[x]['angle']))
+                # aa = angle_derivs(*img(*x),2)
+                fun = angle_derivs
+                #
+                # mag2, fderiv2, sderiv2 = angle_derivs(*img(*x), 2)
             else:
                 fun, img = dihed_angle, self.closest_img_dihed
                 k = self.propers_typed[x]['k']
                 eq = math.radians(float(self.propers_typed[x]['phi']))
-                k = float(k) / 2
+                k = float(k)
+                coords = img(*x)
+                v1 = coords[0] - coords[1]
+                v2 = coords[2] - coords[1]
+                v3 = coords[3] - coords[2]
+                cv1 = cross(v1, v2)
+                cv2 = cross(v2, v3)
                 # mag2, fderiv2, sderiv2 = dihed_derivs(*[v.pos for v in x])
                 # sderiv3 = dihed_derivs2(*[v.pos for v in x])
             k = float(k)
-            #
+
+
             mag, fderiv, sderiv = fun(img(*x), 2)
             if mag < 0:
                 mag *= -1
                 sderiv *= -1
+
             sderiv = sderiv.reshape([-1, 3 * len(x)])
             fderiv = fderiv.flatten()
+            if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
+                                np.isclose(mag, np.pi, atol=1e-15, rtol=0) or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
+                fderiv = np.zeros(fderiv.shape)
+                sderiv = np.zeros(sderiv.shape)
             hessian[np.ix_(idx, idx)] += 2 * k * (np.einsum('i,j', fderiv, fderiv) + (mag - eq) * sderiv)
         return hessian
 
@@ -603,6 +624,7 @@ class Compound(object):
 
     @pos.setter
     def pos(self, value):
+        value = np.array(value)
         if not self.children:
             self._pos = value
         else:
@@ -716,30 +738,27 @@ class Compound(object):
         return np.array(lmps.gather_atoms('x', 1,3)).reshape([-1, 3])#np.ctypeslib.as_array(lmps.extract_atom("x", 3).contents, shape=self.xyz.shape)
 
 
-    def vmd(self,ports=1,atoms=[],label_sorted=1, mol2=0, types=0):
+    def vmd(self,ports=1,atoms=None,label_sorted=1, mol2=0, types=0, commands='pbc box\n '):
         """ see the system in vmd """
-
-        os.system('>txt;# echo "mol new {out.lammpstrj} type {lammpstrj} first 0 last -1 step 1 waitfor -1" >> txt')
-        if atoms:
+        nme = 'out.mol2' if mol2 else 'out.lammpstrj'
+        f = open('txt', 'w')
+        # os.system('>txt;# echo "mol new {out.lammpstrj} type {lammpstrj} first 0 last -1 step 1 waitfor -1" >> txt')
+        if atoms is not None:
             if not hasattr(atoms, '__iter__'):
                 atoms = [atoms]
             else:
                 atoms = list(atoms)
-            idx = np.in1d(self.particles_label_sorted(),atoms)
-            os.system('echo "mol addrep 0" >>txt')
-            os.system('echo "mol modstyle 1 0 VDW 0.3 30." >>txt')
-            os.system('echo "mol modselect 1 0 index '+(np.sum(idx)*'{} ').format(*np.nonzero(idx)[0])+'" >>txt')
-
-        if mol2:
-            self.save('out.mol2')
-            os.system(f'echo "pbc set {{{self.box.a} {self.box.b} {self.box.c} {self.box.alph} {self.box.bet} {self.box.gam}'
-                      f'}} -all" >> txt')
-            os.system('/home/ali/software/vmd-1.9.4a43/bin2/vmd out.mol2 -e txt')
-            os.system('rm out.mol2 txt')
-        else:
-            self.write_lammpstrj(ports=ports,label_sorted=label_sorted, types=types)
-            os.system('/home/ali/software/vmd-1.9.4a43/bin2/vmd out.lammpstrj -e txt')
-            os.system('rm out.lammpstrj txt')
+            idx = np.in1d(self.particles() if mol2 else self.particles_label_sorted(),atoms)
+            f.write('mol addrep 0\n'
+                    'mol modstyle 1 0 VDW 0.3 30.\n'
+                    'mol modselect 1 0 index '+(np.sum(idx)*'{} ').format(*np.nonzero(idx)[0])+'\n')
+        
+        f.write(f'pbc set {{{self.box.a} {self.box.b} {self.box.c} {self.box.alph} {self.box.bet} {self.box.gam}}} -all\n')
+        f.write(commands)
+        f.close()
+        self.save(nme) if mol2 else self.write_lammpstrj()
+        os.system(f'/home/ali/software/vmd-1.9.4a43/bin2/vmd {nme} -e txt')
+        os.system(f'rm {nme} txt')
 
     def write_lammpstrj(self, fle='out', unit_set='real',ports=1, label_sorted=1, types=0):
         """Write one or more frames of data to a lammpstrj file.
@@ -1665,6 +1684,7 @@ class Compound(object):
         _to_topology
 
         """
+        import mdtraj as md
         atom_list = [particle for particle in self.particles_label_sorted(0)]
 
         top = self._to_topology(atom_list, chains, residues)
@@ -1696,6 +1716,7 @@ class Compound(object):
 
         """
         from mdtraj.core.topology import Topology
+        from mdtraj.core.element import get_by_symbol
 
         if isinstance(chains, str):
             chains = [chains]
@@ -2639,7 +2660,7 @@ class Compound(object):
                         propers.add(tuple([x for x in ipath]))
         return self.bond_graph.edges, angles, propers
     
-    def create_bonding_all(self):
+    def create_bonding_all(self, kb=300, ka=500, kd=500, acfpath=None):
         import pymatgen.core.periodic_table as pt
         # ff = ElementTree(element=Element('ForceField'))
         types = equivalence_classes(self.particles_label_sorted(), lambda x,y: x.name==y.name)
@@ -2647,11 +2668,16 @@ class Compound(object):
         self.ff = FF()
         # aa = [[ 89.  , 227.03], [ 47.  , 107.87], [ 13.  ,  26.98], [ 95.  , 243.  ], [ 18.  ,  39.95], [ 33.  ,  74.92], [ 85.  , 210.  ], [ 79.  , 196.97], [  5.  ,  10.81], [ 56.  , 137.33], [  4.  ,   9.01], [ 83.  , 208.98], [ 97.  , 247.  ], [ 35.  ,  79.9 ], [  6.  ,  12.01], [ 20.  ,  40.08], [ 48.  , 112.41], [ 58.  , 140.12], [ 98.  , 251.  ], [ 17.  ,  35.45], [ 96.  , 247.  ], [ 27.  ,  58.93], [ 24.  ,  52.  ], [ 55.  , 132.91], [ 29.  ,  63.55], [ 66.  , 162.5 ], [ 68.  , 167.26], [ 99.  , 252.  ], [ 63.  , 151.97], [  9.  ,  19.  ], [ 26.  ,  55.85], [100.  , 257.  ], [ 87.  , 223.  ], [ 31.  ,  69.72], [ 64.  , 157.25], [ 32.  ,  72.61], [  1.  ,   1.01], [105.  , 260.  ], [  2.  ,   4.  ], [ 72.  , 178.49], [ 80.  , 200.59], [ 67.  , 164.93], [ 53.  , 126.91], [ 49.  , 114.82], [ 77.  , 192.22], [ 19.  ,  39.1 ], [ 36.  ,  83.8 ], [ 57.  , 138.91], [  3.  ,   6.94], [103.  , 260.  ], [ 71.  , 174.97], [101.  , 258.  ], [ 12.  ,  24.31], [ 25.  ,  54.94], [ 42.  ,  95.94], [  7.  ,  14.01], [ 11.  ,  22.99], [ 41.  ,  92.91], [ 60.  , 144.24], [ 10.  ,  20.18], [ 28.  ,  58.69], [102.  , 259.  ], [ 93.  , 237.05], [  8.  ,  16.  ], [ 76.  , 190.2 ], [ 15.  ,  30.97], [ 91.  , 231.04], [ 82.  , 207.2 ], [ 46.  , 106.42], [ 61.  , 145.  ], [ 84.  , 209.  ], [ 59.  , 140.91], [ 78.  , 195.08], [ 94.  , 244.  ], [ 88.  , 226.03], [ 37.  ,  85.47], [ 75.  , 186.21], [104.  , 261.  ], [ 45.  , 102.91], [ 86.  , 222.  ], [ 44.  , 101.07], [ 16.  ,  32.07], [ 51.  , 121.75], [ 21.  ,  44.96], [ 34.  ,  78.96], [ 14.  ,  28.09], [ 62.  , 150.36], [ 50.  , 118.71], [ 38.  ,  87.62], [ 73.  , 180.95], [ 65.  , 158.93], [ 43.  ,  98.  ], [ 52.  , 127.6 ], [ 90.  , 232.04], [ 22.  ,  47.88], [ 81.  , 204.38], [ 69.  , 168.93], [ 92.  , 238.03], [ 23.  ,  50.94], [ 74.  , 183.85], [ 54.  , 131.29], [ 39.  ,  88.91], [ 70.  , 173.04], [ 30.  ,  65.39], [ 40.  ,  91.22], [106.  ,   2.01]]
         # aa = {x[0]:x[1] for x in aa}
+
+        chg = check_output(''' awk 'BEGIN{flg=0};/--/{getline;flg=!flg}flg{print $5}' '''+os.path.join(acfpath,'ACF.dat'), shell=1)
+        chg = np.genfromtxt(io.BytesIO(chg))
+        elemchg = {'Ca': 8, 'H': 1, 'O': 6, 'Si': 4, 'C': 4}  # Ca, H, O, Si, C
+
         for x in types:
             mass = pt.Element(x[0].name).atomic_mass
             for i, atom in enumerate(x, 1):
                 nme = atom.name+str(i)
-                atom.type = {'name':nme, 'mass':str(mass.real), 'element':atom.name}
+                atom.type = {'name':nme, 'mass':str(mass.real), 'element':atom.name, 'charge':str(elemchg[atom.name] - chg[i])}
                 self.ff.atom_types.append(atom.type)
 
         self.bonds_typed = OrderedDict()
@@ -2659,22 +2685,36 @@ class Compound(object):
         self.propers_typed = OrderedDict()
 
         bonds, angles, propers = self.network_b_a_d()
-
         for x in bonds:
             # if cnt==1:
             mag = bond_length(self.closest_img_bond(*x), 0)
-            self.ff.bond_types.append({'k':" 344.65772", 'length':str(mag[0]), 'type1':x[0].type['name'], 'type2':x[1].type['name']})
+            self.ff.bond_types.append({'k':str(kb), 'length':str(mag[0]), 'type1':x[0].type['name'], 'type2':x[1].type['name']})
             self.bonds_typed[x] = self.ff.bond_types[-1]
             # cnt += 1
 
         for x in angles:
             mag = bend_angle(self.closest_img_angle(*x), 0)
-            self.ff.angle_types.append({'k':" 50", 'angle':str(math.degrees(mag[0])), 'type1':x[0].type['name'], 'type2':x[1].type['name'], 'type3':x[2].type['name']})
+            if np.isclose(mag, np.pi, atol=.001, rtol=0) or np.isclose(mag, 0, atol=.001):
+                continue
+            self.ff.angle_types.append({'k':str(ka), 'angle':str(math.degrees(mag[0])), 'type1':x[0].type['name'], 'type2':x[1].type['name'], 'type3':x[2].type['name']})
             self.angles_typed[x] = self.ff.angle_types[-1]
 
         for x in propers:
-            mag = dihed_angle(self.closest_img_dihed(*x), 0)
-            self.ff.proper_types.append({'k':" 50", 'phi':str(math.degrees(abs(mag[0]))), 'type1':x[0].type['name'],
+            img = self.closest_img_dihed
+            coords = img(*x)
+            v1 = coords[0] - coords[1]
+            v2 = coords[2] - coords[1]
+            v3 = coords[3] - coords[2]
+            cv1 = cross(v1, v2)
+            cv2 = cross(v2, v3)
+            close = lambda x, y: np.allclose(x, y, atol=.001, rtol=0)
+            if close(cv1, 0) or close(cv2, 0):
+                continue
+            mag = dihed_angle(coords, 0)
+            if close(mag, 0) or close(np.abs(mag), np.pi):
+                continue
+                
+            self.ff.proper_types.append({'k':str(kd), 'phi':str(math.degrees(abs(mag[0]))), 'type1':x[0].type['name'],
                                         'type2':x[1].type['name'], 'type3':x[2].type['name'], 'type4':x[3].type['name']})
             self.propers_typed[x] = self.ff.proper_types[-1]
 
@@ -2685,6 +2725,7 @@ class Compound(object):
         n = self.n_particles()
         qlist = [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
         B=[]
+        removed = []
         angles, diheds = [], []
         for cnt, x in enumerate(qlist):
             idx = []
@@ -2693,17 +2734,21 @@ class Compound(object):
                 idx.extend([3 * tmp, 3 * tmp + 1, 3 * tmp + 2])
             jac = np.zeros(3*n)
             if len(x) == 2:
+                img = self.closest_img_bond
                 fun = bond_length
             elif len(x) == 3:
+                img = self.closest_img_angle
                 fun = bend_angle
             else:
+                img = self.closest_img_dihed
                 fun = dihed_angle
-            _, tmp = fun([v.pos for v in x], 1)
+            _, tmp = fun(img(*x), 1)
             jac[idx] = tmp.flatten()
 
             if matrix_rank([*B, jac]) == len(B) + 1:
                 B.append(jac)
             else:
+                removed.append(x)
                 if len(x) == 2:
                     raise Exception('bonds are not independent')
                 elif len(x) == 3:
@@ -2712,6 +2757,62 @@ class Compound(object):
                 else:
                     self.ff.proper_types.remove(self.propers_typed[x])
                     self.propers_typed.pop(x)
+        return removed
+
+    def getB(self):
+        '''get Wilson B matrix'''
+        nlst = self.particles_label_sorted()
+        n = self.n_particles()
+        qlist = [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
+        B=np.zeros([3*n-6, 3*n])
+        grad = np.zeros(3*n-6)
+        hessian = np.zeros([3*n, 3*n])
+        K = deepcopy(hessian)
+        for cnt, x in enumerate(qlist):
+            idx = []
+            for v in x:
+                tmp = nlst.index(v)
+                idx.extend([3 * tmp, 3 * tmp + 1, 3 * tmp + 2])
+            if len(x) == 2:
+                img = self.closest_img_bond
+                fun = bond_length
+                type = self.bonds_typed[x]
+                mag0 = float(type['length'])
+            elif len(x) == 3:
+                img = self.closest_img_angle
+                fun = bend_angle
+                type = self.angles_typed[x]
+                mag0 = math.radians(float(type['angle']))
+            else:
+                img = self.closest_img_dihed
+                fun = dihed_angle
+                type = self.propers_typed[x]
+                mag0 = math.radians(float(type['phi']))
+            mag, fderiv, sderiv = fun(img(*x), 2)
+            B[cnt, idx] = fderiv.flatten()
+            k = float(type['k'])
+            if mag < 0:
+                mag *= -1
+                sderiv *= -1
+
+            sderiv = sderiv.reshape([-1, 3 * len(x)])
+            if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
+                                np.isclose(mag, np.pi, atol=1e-15, rtol=0)): #or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
+                fderiv = np.zeros(fderiv.shape)
+                sderiv = np.zeros(sderiv.shape)
+            hessian[np.ix_(idx, idx)] = sderiv * 2 * k * (mag - mag0)
+            K += hessian
+        return B, K
+
+
+    def hessx_to_internal(self, Hx):
+        B, K = self.getB()
+
+        Binv = np.linalg.pinv(B)
+
+        return Binv.T @ (Hx - K) @ Binv   # eq 10 in "the efficient optimiztion of molecular geometries using redundant . . . "
+
+
 
     def gen_angs_and_diheds(self):
         angles = OrderedSet()
@@ -2858,9 +2959,10 @@ class Compound(object):
             data.write('\nPair Coeffs # real \n')
             data.write('#\tepsilon (kcal/mol)\t\tsigma (Angstrom)\n')
 
-            for i,y in enumerate(self.ff.atom_types,1):
-                nb = [x for x in self.ff.nonbond_types if x['type'] == y['name']][0]
-                data.write(f"{i}\t{nb['epsilon'] if lj else 0}\t\t{nb['sigma']}\t\t# {nb['type']}\n")
+            if self.ff.nonbond_types:
+                for i,y in enumerate(self.ff.atom_types,1):
+                    nb = [x for x in self.ff.nonbond_types if x['type'] == y['name']][0]
+                    data.write(f"{i}\t{nb['epsilon'] if lj else 0}\t\t{nb['sigma']}\t\t# {nb['type']}\n")
 
             # Bond coefficients
             data.write('\nBond Coeffs # harmonic\n')
@@ -2944,11 +3046,12 @@ class Compound(object):
         return out
 
     def get_angles(self, angles, units='degrees'):
+        '''angles:list of particles'''
         import math
         out = []
         for p in angles:
-            v1 = p[0]._pos - p[1]._pos
-            v2 = p[2]._pos - p[1]._pos
+            v1 = p[0].pos - p[1].pos
+            v2 = p[2].pos - p[1].pos
             d = np.dot(v1, v2) / np.linalg.norm(v1) / np.linalg.norm(v2)
             d = min(d, 1)
             d = max(d, -1)
@@ -3252,6 +3355,7 @@ end structure
                 keys = [y for y in x.keys() if 'type' not in y]
                 f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]} {type_map[x['type4']]} "+ (len(keys)*'{} ').format(*[x[z] for z in keys]) +f"\t# {x['type1']}\t{x['type2']}\t{x['type3']}\t{x['type4']}\n")
             f.write('\n slower .05')
+            f.write('\noutput movie xyz')
 
 
     def rotate_vecs(self, v1, v2, pnt=None):
@@ -3269,6 +3373,7 @@ end structure
             x.orientation = rot.apply(x.orientation)
 
     def rotate_around(self, vec, ang, degrees=1):
+        ''' rotate compound about an axis'''
         vec = np.array(vec)
         vec = vec/norm(vec)
         if degrees:

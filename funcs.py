@@ -8,14 +8,17 @@ from collections.abc import Iterable
 from parmed import unit as u
 from subprocess import check_output
 from molmod.ic import bond_length, bend_angle, dihed_angle
+from itertools import combinations, chain
 
 # from lib.recipes.alkane import Alkane
 # from compound import Compound, compload, Port
 from copy import deepcopy
 
+
+def zet(s):
+    return (s[0] == s[1]) - (s[0] == s[2])
+
 def dihed_derivs2(p1,p2,p3,p4):
-    def zet(s):
-        return (s[0]==s[1]) - (s[0]==s[2])
 
     u = p1 - p2
     w = p3 - p2
@@ -72,6 +75,65 @@ def dihed_derivs2(p1,p2,p3,p4):
                   (1- (a==b))*(zet(a+'no')*zet(b+'op') + zet(a+'po')*zet(b+'om'))*e8
     return val
 
+def angle_derivs(rs, n=0):
+    p1,p2,p3 = rs
+    u = p1 - p2
+    v = p3 - p2
+    nu,nv = norm(u), norm(v)
+    u, v = u/nu, v/nv
+    ang = np.arccos(dot(u, v))
+    if n == 0:
+        return ang
+        
+    w = cross(u, v)
+    if np.allclose(w, 0):
+        # w = cross(u, [1, -1, 1])
+        u = u + np.array([1, -1, 1])*.0001
+        w = cross(u, v)
+    if np.allclose(w, 0):
+        w = cross(u, [-1, 1, 1])
+    nw = norm(w)
+    w = w/nw
+
+    val = np.zeros(9)
+    if n > 0:
+        for cnt, a in enumerate('mon'):
+            val[3*cnt:3*(cnt+1)] = zet(a+'mo')*cross(u, w)/nu + zet(a+'no')*cross(w, v)/nv
+        if n == 1:
+            return ang, val
+
+    cqa = dot(u, v)
+    sqa = sqrt(1-cqa**2)
+
+    sval = np.zeros([9, 9])
+    if n==2:
+        try:
+            for cnt1, a in enumerate('mon'):
+                for cnt2, b in enumerate('mon'):
+                    sval[3*cnt1:3*(cnt1+1),3*cnt2:3*(cnt2+1)] =\
+                        zet(a+'mo')*zet(b+'mo')*(einsum('i,j', u, v) + einsum('j,i', u, v) - 3*einsum('i,j', u, u)*cqa + np.eye(3)*cqa)/nu**2/sqa +\
+                        zet(a+'no')*zet(b+'no')*(einsum('i,j', v, u) + einsum('j,i', v, u) - 3*einsum('i,j', v, v)*cqa + np.eye(3)*cqa)/nu**2/sqa +\
+                        zet(a+'mo')*zet(b+'no')*(einsum('i,j', u, u) + einsum('j,i', v, v) - einsum('i,j', u, v)*cqa - np.eye(3))/nu/nv/sqa +\
+                        zet(a+'no')*zet(b+'mo')*(einsum('i,j', v, v) + einsum('j,i', u, u) - einsum('i,j', v, u)*cqa - np.eye(3))/nu/nv/sqa -\
+                        cqa/sqa*einsum('i,j', val[3*cnt1:3*(cnt1+1)], val[3*cnt2:3*(cnt2+1)])
+        except FloatingPointError:
+            sval = np.zeros([9, 9])
+
+        return ang, val, sval
+        
+
+
+def plt_eigenvecs(coords, ev):
+    import plotly.graph_objects as go
+
+    # eigenvec = eigenvec.reshape([-1, 3])
+
+    fig = go.Figure(data=go.Cone(x=coords[:, 0], y=coords[:, 1], z=coords[:, 2], u=ev[0::3], v=ev[1::3], w=ev[2::3], anchor='tip', hoverinfo='u+v+w'))
+    # fig.add_trace(go.Scatter3d(x=coords[:, 0], y=coords[:, 1], z=coords[:, 2], mode='markers'))
+    # fig.update_layout(scene_camera_eye=dict(x=-0.76, y=1.8, z=0.92))
+
+    fig.show()
+
 
 def sub_list(lst, idx):
     return [x for x in lst if lst.index(x) in idx]
@@ -79,21 +141,107 @@ def sub_list(lst, idx):
 
 def mat_prt(mat, frm = '{:12.5f} '):
     print(*[(len(x)*frm).format(*x) for x in mat], sep='\n')
+    
+def brace_to_curly(lst):
+    return str(lst).replace('[','{').replace(']', '}')
+
 
 def gulp_hessian(comp, direc='gulp.out'):
     '''extract hessian from gulp output'''
     n = comp.n_particles()*3
-    dyn_mat = check_output('''awk '/Real Dynamical/{getline;getline;flg=1}NF<2{flg=0}flg' '''+direc, shell=1)
-    dyn_mat = np.array(dyn_mat.decode('utf-8').split(), dtype=float)[-n*n:].reshape([n, -1])
+
+    with  open('gulp.out', 'r') as f:
+        for cnt, x in enumerate(f):
+            if 'Real Dynamical' in x:
+                f.readline()
+                vals = [None] * n**2
+                for i in range(n**2):
+                    tmp = f.read(11)
+                    if '\n' in tmp:
+                        tmp = tmp.replace('\n', '') + f.read(1)
+                    vals[i] = tmp
+                break
     
-    hessian = np.zeros([n, n])
+    hessian = np.array(vals, dtype=float).reshape([n, n])
+    
+    
+    # dyn_mat = check_output('''awk '/Real Dynamical/{getline;getline;flg=1}NF<2{flg=0}flg' '''+direc, shell=1)
+    # dyn_mat = np.array(dyn_mat.decode('utf-8').split(), dtype=float)[-n*n:].reshape([n, -1])
+    #
+    # hessian = np.zeros([n, n])
     parts = comp.particles_label_sorted()
     masses = np.repeat(np.array([x.type['mass'] for x in parts], dtype=float), 3)
     for i in range(n):
         for j in range(n):
-            hessian[i, j] = np.sqrt(masses[i]*masses[j]) * dyn_mat[i, j]
+            hessian[i, j] = np.sqrt(masses[i]*masses[j]) * hessian[i, j]
     return ev_to_kcalpmol(hessian)._value
 
+def join_silane(portsil, alk, port, tpairs, bpairs):
+    from compound import Port
+    
+    for j, x in enumerate([tpairs[1], bpairs[1]]):
+        pos1 = np.mean([i.pos for i in x], axis=0)
+        p = Port(pos=pos1, orientation=x[1].pos-x[0].pos)
+        port.add(p, expand=0)
+        port.remove(x)
+        calk = deepcopy(alk)
+        portsil.add(calk)
+        portsil.force_overlap(calk, calk[-1], p)
+        if j:
+            calk.reflect(pos1, [0, 0, 1])
+            tmp1 = calk.particles()
+            for z in tmp1:
+                if z.name == 'C':
+                    tmp = list(portsil.bond_graph.neighbors(z))
+                    while tmp:
+                        y = tmp[0]
+                        if y.name == 'H':
+                            portsil.remove(y)
+                        tmp.remove(y)
+                portsil.remove(z)
+
+
+def hybrid_silane_portlandite():
+    from compound import compload, Port, Compound
+    port = compload('/home/ali/ongoing_research/polymer4/14_mbuild/port.cif')
+    port.add_bond([port[4], port[2]])
+    port.add_bond([port[1], port[3]])
+    
+    port.supercell([[2, 0, 0], [1, 2, 0], [0, 0, 1]])
+    port.xyz += np.array([0, 0, 2.2])
+    port.wrap_atoms()
+    
+    topo = [x for x in port.particles(0) if x.name == 'O' and x.pos[2] > 2.2]
+    boto = [x for x in port.particles(0) if x.name == 'O' and x.pos[2] < 2.2]
+    
+    tpairs = pairs_in_rcut(port, combinations(topo, 2), rcut=3.6)
+    bpairs = pairs_in_rcut(port, combinations(boto, 2), rcut=3.6)
+    
+    # we remove for a single pair
+    hparts1, _ = port.neighbs(tpairs[1], port.particles_by_name('H'), 1.2)
+    hparts2, _ = port.neighbs(bpairs[1], port.particles_by_name('H'), 1.2)
+    port.remove(flatten([hparts1, hparts2]))
+    
+    alk = dimer(6)
+    alk.latmat = 50 * np.eye(3)
+    
+    
+    pos1 = np.mean(alk['sil'].xyz[[6, 7]], 0)
+    pos2 = alk['sil'][8].pos
+    alk.add(Port(pos=pos1, orientation=alk['sil'].xyz[6] - alk['sil'].xyz[7]), expand=0)
+    
+    portsil = Compound()
+    portsil.latmat = port.latmat
+    portsil.latmat[2, 2] = 13
+    portsil.add(port, expand=0)
+    
+    join_silane(portsil, alk, port, tpairs, bpairs)
+    
+    portsil.xyz_with_ports += [0, 0, 4]
+    for x in portsil.particles(0):
+        x.name = re.sub('[0-9]', '', x.name)    
+    return portsil
+                
 def hessian_to_dynmat(comp, hess):
     '''multiply by 1/sqrt(m_im_j)'''
     n = comp.n_particles() * 3
@@ -133,6 +281,8 @@ def dihed_derivs(p1,p2,p3,p4,d='dum'):
     B = np.cross(H, G)
 
     phi = np.arccos(dot(A,B)/norm(A)/norm(B))
+    if d==0:
+        return phi
 
     nG = norm(G); nB = norm(B)
     nAsq = norm(A)**2
@@ -196,8 +346,9 @@ def dihed_derivs(p1,p2,p3,p4,d='dum'):
 def gulp_out_coords(direc='gulp.out'):
     coords = check_output('''awk '/Final fractional/{for (i=0;i<6;i++) getline; flg=1}/---/{flg=0}flg{print $4, $5, $6}' '''+direc, shell=1)
     lat = check_output('''awk '/Cartesian lattice/{getline;getline; for (i=0;i<3;i++) {print;getline}}' '''+direc, shell=1)
-
-    return np.genfromtxt(io.BytesIO(coords)) @ np.genfromtxt(io.BytesIO(lat))
+    n = check_output('''awk '/Number of irred/ {print $6}' '''+direc, shell=1).decode('utf-8')
+    n = int(n)
+    return (np.genfromtxt(io.BytesIO(coords)) @ np.genfromtxt(io.BytesIO(lat))) [-n:]
 
 def plane_normal(p1, p2, p3):
     ''' normal to plane from three points '''
@@ -439,10 +590,8 @@ def cut_array2d(array, shape):
 def get_vasp_hessian(direc):
     n = check_output(f' grep -oP -m 1 \'(?<=NIONS =)\\s*[0-9]*\' {os.path.join(direc,"OUTCAR")} ', shell=1)
     n = int(n.decode('utf-8'))
-    hessian = check_output(
-        f''' awk '/^  1X/{{flg=1}};/^ Eigen/{{flg=0}}flg{{$1="";print $0}}' {direc}/OUTCAR ''',
-        shell=1)
-    return (u.AVOGADRO_CONSTANT_NA._value *(np.genfromtxt(io.BytesIO(hessian)) *
+    hessian = check_output(f''' awk '/^  1X/{{flg=1}};/^ Eigen/{{flg=0}}flg{{$1="";print $0}}' {direc}/OUTCAR ''', shell=1)
+    return -(u.AVOGADRO_CONSTANT_NA._value *(np.genfromtxt(io.BytesIO(hessian)) *
                                             u.elementary_charge * u.volts).in_units_of(u.kilocalorie))._value
 
 def  unit_perps(c0, c1, c2):
@@ -488,7 +637,7 @@ def get_vasp_freqs(direc):
     file = check_output(command, shell=1)
     return np.genfromtxt(io.BytesIO(file))
 
-def get_gulp_freqs(direc):
+def get_gulp_freqs(direc='gulp.out'):
     command = f"awk '/Frequencies/{{getline;getline;flg=1}};NF==0&&flg{{print \"sep\";flg=0}};flg' {direc}"
     file = check_output(command, shell=1).decode('utf-8').split('sep')[-2].replace('\n',' ')
     return np.fromstring(file, sep=' ')
