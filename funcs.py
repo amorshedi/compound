@@ -2,17 +2,179 @@ import numpy as np
 import os, re, subprocess, math, io
 from lammps import lammps
 from numpy import dot, cross, sqrt, einsum
-from numpy.linalg import norm, svd
+from numpy.linalg import norm, svd, eig
 from math import degrees, radians
 from collections.abc import Iterable
 from parmed import unit as u
 from subprocess import check_output
 from molmod.ic import bond_length, bend_angle, dihed_angle
 from itertools import combinations, chain
+from scipy.spatial.transform import Rotation as R
 
 # from lib.recipes.alkane import Alkane
 # from compound import Compound, compload, Port
 from copy import deepcopy
+
+def normalize(x):
+    return x/norm(x)
+
+def hybrid_struct():
+    from compound import compload
+    comp = hybrid_silane_portlandite()
+    comp.xyz_label_sorted = compload('/home/ali/ongoing_research/polymer4/45_hybrid_hexane/2_opt_allfree_prec/CONTCAR').xyz_label_sorted
+    
+    comp.generate_bonds(comp.particles_by_name('C'), comp.particles_by_name('Si'), 1.5, 1.7)
+    comp.generate_bonds(comp.particles_by_name('Ca'), comp.particles_by_name('O'), 2.3, 2.5)
+    comp.create_bonding_all(kb=0, ka=0, kd=0, acfpath='/home/ali/ongoing_research/polymer4/45_hybrid_hexane/4_charge/')
+    rm = []
+    for x in comp.propers_typed.keys():
+        if [y for y in x if y.name == 'Ca']:
+            rm.append(x)
+    
+    for x in rm:
+        comp.ff.proper_types.remove(comp.propers_typed[x])
+        comp.propers_typed.pop(x)
+    return comp
+
+def rot_ax_ang(ax, ang, vec, deg=1):
+    ax = normalize(ax)
+    if deg:
+        ang = math.radians(ang)
+    rot = R.from_rotvec(ax * ang)
+    return rot.apply(vec)
+
+def get_fitted(comp, direc='.'):
+    pth = os.path.join(direc, 'gulp.in')
+    tmp = check_output("""awk '/harm/||/three/{getline;flg=1}NF==0{flg=0}flg' """+pth+
+                       """| awk '/harm/||/three/{getline;flg=1}NF==0{flg=0}flg' """+pth+""" |
+                          grep -Po '(?<=\s)[0-9].*(?=\#)'""", shell=1)
+    qlist = [*comp.bonds_typed, *comp.angles_typed, *comp.propers_typed]
+    k, rest, flags = [],[],[]
+    rest = deepcopy(k)
+    for x, y in zip(tmp.decode().replace('\t','').split('\n')[:-1], qlist):
+        x = x.split()
+        k.append(x[0])
+        rest.append(x[1])
+        flags.append(x[-2:])
+
+    pth = os.path.join(direc, 'gulp.out')
+    tmp = check_output("""awk '/Parameter        P/{getline;getline;getline;flg=1}/-----/{flg=0}flg{print $3}'  """+pth, shell=1)
+    # vals = np.genfromtxt(io.BytesIO(tmp))
+    
+    return k, rest, np.array(flags, dtype=int), tmp.decode().split('\n')[:-1]
+    
+def shell(comm, inp=''):
+    '''comm: command to run
+    inp: a byte string to give as input'''
+    return check_output(comm, shell=1, input=inp, executable='/bin/bash') if inp else check_output(comm, shell=1, executable='/bin/bash')
+def b_to_mat(inp, dt=float):
+    return np.genfromtxt(io.BytesIO(inp), dtype=dt)
+
+def amass(nme):
+    ''' nme: a string with the name of the element '''
+    import pymatgen.core.periodic_table as pt
+    return pt.Element(nme).atomic_mass.real
+
+def dist(c1, c2):
+    c1, c2 = map(np.array, [c1, c2])
+    return norm(c1 - c2)
+
+
+def modsem(comp, outcar_pth, vibrational_scaling=1, ff_xml_pth=None):
+    ''' initial version is in /home/ali/ongoing_research/my_python_codes/modsem'''
+    from indexed import IndexedOrderedDict
+    # faulthandler.enable()
+
+    vibrational_scaling_squared = vibrational_scaling ** 2 # Square the vibrational scaling used for frequencies
+    parts = comp.particles_label_sorted()
+    eigenvectors, eigenvalues = dict(), dict()
+    hessian = -get_vasp_hessian(outcar_pth)
+    n = comp.n_particles()
+    hessian_partial = cut_array2d(hessian, [n, n])
+    for i, p1 in enumerate(parts):
+        for j, p2 in enumerate(parts):
+            eigenvalues[p1, p2], eigenvectors[p1, p2] = eig(hessian_partial[i, j])
+
+    bonds_list, angles_list, diheds_list = map(list, (comp.bonds_typed.keys(), comp.angles_typed.keys(), comp.propers_typed))
+    bonds_length_list = IndexedOrderedDict()
+
+    for x in bonds_list:
+        bonds_length_list[frozenset(x)] = dist(*comp.closest_img_bond(*x))
+    atom_names = [x.type['name'] for x in comp.particles_label_sorted()]
+
+    k_b = np.zeros(len(bonds_list))
+    from modsem_funcs import force_constant_bond
+    for i, bnd in enumerate(bonds_list):
+        c0, c1 = comp.closest_img_bond(bnd[0], bnd[1])
+        AB = force_constant_bond(bnd[0], bnd[1], eigenvalues, eigenvectors, c0, c1)
+        BA = force_constant_bond(bnd[1], bnd[0], eigenvalues, eigenvectors, c0, c1)
+
+        k_b[i] = np.real((AB + BA) / 2) * vibrational_scaling_squared # Order of bonds sometimes causes slight differences, find the mean
+
+    val = [0, 2]
+    k_a, theta = [np.zeros(len(angles_list)) for _ in range(2)]
+
+    for iang, ang in enumerate(angles_list):
+        same_centers = [x for x in angles_list if x[1] == ang[1]]
+        c0, c1, c2 = comp.closest_img_angle(*ang)
+        upa, upc, theta[iang] = unit_perps(c0,c1,c2)
+        upac = upa, upc
+
+        invk = 0
+        for i, bond in enumerate([ang[0: 2], ang[2:0:-1]]):
+            tmp = np.abs(upac[i] @ eigenvectors[bond[0], bond[1]])
+            ki = tmp @ eigenvalues[bond[0], bond[1]]
+
+            coeff = cnt = 0
+            for x in [y for y in same_centers if bond[0] in y and set(y) != set(ang)]: #among bonds with the same center as ang, the ones share bond with ang
+                c0, c1, c2 = comp.closest_img_angle(*bond, *[i for i in x if i not in bond])
+                up = unit_perps(c0, c1, c2)
+                coeff += np.abs(upac[i] @ up[0]) ** 2
+                cnt += 1
+            fact = 1 + coeff / cnt if cnt else 1
+            invk += fact / (bonds_length_list[frozenset(bond)] ** 2 * ki)
+        k_a[iang] = 1 / np.real(invk) / 2
+
+    k_d, phi = [np.zeros(len(diheds_list)) for _ in range(2)]
+    for i, dihed in enumerate(diheds_list):
+        points = comp.closest_img_dihed(*dihed[0:4])
+        normals = plane_normal(*points[0:3]), plane_normal(*points[1:])
+        phi[i] = np.degrees(np.arccos(normals[0] @ normals[1]))
+
+        invk = 0
+        for j in range(2): # loop over each dihedral arm (AB or CD)
+            blen = bonds_length_list[frozenset(dihed[2*j:2*j+2])]
+            sint_sq = np.sin(angle_between_vecs(points[j]-points[j+1], points[j+2]-points[j+1], degrees=0))**2
+            tmp = np.abs(normals[j] @ eigenvectors[dihed[2*j], dihed[2*j+1]])
+            tmp = tmp @ eigenvalues[dihed[2*j], dihed[2*j+1]]
+
+            invk += 1/blen/sint_sq/tmp
+        k_d[i] = 1/invk.real
+
+    return np.array([*k_b, *k_a, *k_d])
+
+
+def swap_rows_cols(mat, idx):
+    idx = list(map(list, idx))
+    for i in range(2):
+        for x in idx:
+            if len(set(x)) == 1:
+                continue
+            mat[x] = mat[np.flip(x)]
+        mat = mat.T
+
+    return mat
+
+def rm_dependent_rows(mat):
+    mat = np.array(mat)
+    
+    out = []
+    idx = []
+    for cnt, x in enumerate(mat):
+        if np.linalg.matrix_rank([*out, x]) == len(out) + 1:
+            out.append(x)
+            idx.append(cnt)
+    return idx, np.array(out)[:, idx]
 
 
 def zet(s):
@@ -277,8 +439,8 @@ def dihed_derivs(p1,p2,p3,p4,d='dum'):
     F = p1 - p2
     G = p2 - p3
     H = p4 - p3
-    A = np.cross(F, G)
-    B = np.cross(H, G)
+    A = cross(F, G)
+    B = cross(H, G)
 
     phi = np.arccos(dot(A,B)/norm(A)/norm(B))
     if d==0:
@@ -290,7 +452,6 @@ def dihed_derivs(p1,p2,p3,p4,d='dum'):
 
     dfg = dot(F,G)
     dhg = dot(H,G)
-    dfg = dot(F,G)
 
     dphi_dr1 = -nG/nAsq*A
     dphi_dr2 = nG/nAsq*A + dfg/nAsq/nG*A - dhg/nBsq/nG*B
@@ -315,21 +476,21 @@ def dihed_derivs(p1,p2,p3,p4,d='dum'):
     cfa = cross(F,A)
     chb = cross(H,B)
     cgb = cross(G,B)
-    t1 = np.einsum('i,j', A, cga) + np.einsum('i,j', cga,A)
-    t2 = np.einsum('i,j', A, cfa) + np.einsum('i,j', cfa,A)
-    t3 = np.einsum('i,j', B, cgb) + np.einsum('i,j', cgb,B)
-    t4 = np.einsum('i,j', B, chb) + np.einsum('i,j', chb,B)
+    t1 = einsum('i,j', A, cga) + einsum('i,j', cga, A)
+    t2 = einsum('i,j', A, cfa) + einsum('i,j', cfa, A)
+    t3 = einsum('i,j', B, cgb) + einsum('i,j', cgb, B)
+    t4 = einsum('i,j', B, chb) + einsum('i,j', chb, B)
 
     d2phi_dT2[np.ix_(s1, s1)] = nG/nAsq**2*t1 #eq 32
 
-    d2phi_dT2[np.ix_(s2, s2)] = 1/2/nG**3/nAsq*t1 + dfg/nG/nAsq**2*t2 -  1/2/nG**3/nB**2*t3 - dhg/nG/nB**4*t4 #eq 44
+    d2phi_dT2[np.ix_(s2, s2)] = 1/2/nG**3/nAsq*t1 + dfg/nG/nAsq**2*t2 -  1/2/nG**3/nBsq*t3 - dhg/nG/nBsq**2*t4 #eq 44
 
     d2phi_dT2[np.ix_(s3, s3)] = -nG/nBsq**2*t3 #eq 33
 
-    d2phi_dT2[np.ix_(s1, s2)] = -1/nG/nAsq**2*(nG**2*np.einsum('i,j', cfa, A) + dfg*np.einsum('i,j', A, cga)) #eq 38
+    d2phi_dT2[np.ix_(s1, s2)] = -1/nG/nAsq**2*(nG**2*einsum('i,j', cfa, A) + dfg*einsum('i,j', A, cga)) #eq 38
     d2phi_dT2[np.ix_(s2, s1)] = d2phi_dT2[np.ix_(s1, s2)]
 
-    d2phi_dT2[np.ix_(s2, s3)] = 1/nG/nBsq**2*(nG**2*np.einsum('i,j', chb, B) + dhg*np.einsum('i,j', B, cgb)) #eq 39
+    d2phi_dT2[np.ix_(s2, s3)] = 1/nG/nBsq**2*(nG**2*einsum('i,j', chb, B) + dhg*einsum('i,j', B, cgb)) #eq 39
     d2phi_dT2[np.ix_(s3, s2)] = d2phi_dT2[np.ix_(s2, s3)]
 
     # kk = np.zeros([12,12])
@@ -340,8 +501,8 @@ def dihed_derivs(p1,p2,p3,p4,d='dum'):
     #             for l in range(9):
     #                 tmp += dT_dr[k, i]*dT_dr[l, j]*d2phi_dT2[k, l]
     #         kk[i, j] = tmp
-    tmp = np.einsum('ij,kl', dT_dr, dT_dr)
-    return phi, dphi_dr, np.einsum('ij,ikjl',d2phi_dT2,tmp)
+    tmp = einsum('ij,kl', dT_dr, dT_dr)
+    return phi, dphi_dr, einsum('ij,ikjl',d2phi_dT2,tmp)
 
 def gulp_out_coords(direc='gulp.out'):
     coords = check_output('''awk '/Final fractional/{for (i=0;i<6;i++) getline; flg=1}/---/{flg=0}flg{print $4, $5, $6}' '''+direc, shell=1)
@@ -384,7 +545,7 @@ def ab_to_es(A, B, reverse=0):
 
     return (A, B) if reverse else (e, s)
 
-def get_2d_arr(inpstr):
+def get_2d_mat(inpstr):
     aa = inpstr.split('\n')
     return np.array([x.split() for x in aa], dtype=float)
 
@@ -546,6 +707,7 @@ def ev_to_kcalpmol(input, reverse=0):
 		input * u.elementary_charge * u.volts).in_units_of(u.kilocalorie)
 
 def get_file_num(outdir):
+    ''' if the file name is sth like out23, it returns 23'''
     files = next(os.walk(f'./{outdir}'))[-1]
     try:
         return np.sort(np.array([int(re.match('[^_a-zA-Z]*', x).group())
@@ -553,7 +715,7 @@ def get_file_num(outdir):
     except:
 	    return 1
 
-def coords_forces_from_outcar(direc, save_npy=0):
+def get_vasp_coords_frcs(direc, save_npy=0):
     '''direc: outcar directory
        nump: number of particles'''
 
@@ -565,7 +727,7 @@ def coords_forces_from_outcar(direc, save_npy=0):
                         for x in dft_pos_frc.decode('utf-8').split('\n')[:-1]])
     dft_pos_frc = cut_array2d(dft_pos_frc, [len(dft_pos_frc) // n, 1])
 
-    return [x[:, :3] for x in dft_pos_frc], [x[:, 3:] for x in dft_pos_frc]
+    return np.array([x[:, :3] for x in dft_pos_frc]), np.array([x[:, 3:] for x in dft_pos_frc])
 
 def cut_array2d(array, shape):
     xstep = array.shape[0]//shape[0]

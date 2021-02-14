@@ -26,7 +26,7 @@ from numpy.linalg import inv, norm, det, matrix_rank
 # from coordinate_transform import _translate, _rotate,AxisTransform,RigidTransform, unit_vector, angle
 # from collections import defaultdict
 from orderedset import OrderedSet
-
+# (data.write\()(.*(?=\)))\) # to replace data.write(foo) with out += foo
 #to do list:
 # ForceField from foyer should be in this file somehow
 # nonbond types should have somethig similar to bonds_typed (maybe add 'nonbond' to each atom)
@@ -259,6 +259,10 @@ class Compound(object):
         self.type = []
 
         self.bond_graph = None
+        self.nonbond_typed = OrderedDict()
+        self.bonds_typed = OrderedDict()
+        self.angles_typed = OrderedDict()
+        self.propers_typed = OrderedDict()
 
         self._latmat = np.eye(3)
         self.box = Box(self)
@@ -266,6 +270,7 @@ class Compound(object):
         if names:
             for x, y in zip(names, pos):
                 self.add(Compound(name=x, pos=y))
+        self.ff = FF()
             
     
     @property
@@ -459,10 +464,10 @@ class Compound(object):
 
             sderiv = sderiv.reshape([-1, 3 * len(x)])
             fderiv = fderiv.flatten()
-            if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
-                                np.isclose(mag, np.pi, atol=1e-15, rtol=0) or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
-                fderiv = np.zeros(fderiv.shape)
-                sderiv = np.zeros(sderiv.shape)
+            # if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
+            #                     np.isclose(mag, np.pi, atol=1e-15, rtol=0) or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
+            #     fderiv = np.zeros(fderiv.shape)
+            #     sderiv = np.zeros(sderiv.shape)
             hessian[np.ix_(idx, idx)] += 2 * k * (np.einsum('i,j', fderiv, fderiv) + (mag - eq) * sderiv)
         return hessian
 
@@ -541,7 +546,7 @@ class Compound(object):
         """
         # Preprocessing and validating input type
         if not hasattr(objs_to_remove, '__iter__'):
-            if objs_to_remove not in self:
+            if objs_to_remove not in self :
                 return
             objs_to_remove = [objs_to_remove]
         objs_to_remove = set(objs_to_remove)
@@ -551,6 +556,17 @@ class Compound(object):
                 for p in obj.particles(0):
                     if obj.root.bond_graph.has_node(p):
                         obj.root.bond_graph.remove_node(p)
+                        qlist = [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
+                        lst = [x for x in qlist if p in x]
+                        for x in lst:
+                            if len(x) == 2:
+                                f = self.bonds_typed
+                            if len(x) == 3:
+                                f = self.angles_typed
+                            if len(x) == 4:
+                                f = self.propers_typed
+                            f.pop(x)
+
             obj.parent.children.remove(obj)
             if not obj.parent.children and obj.parent.parent: #all of its children are removed. Remove itself
                 obj.parent.parent.children.remove(obj.parent)
@@ -801,24 +817,25 @@ class Compound(object):
 
         path.replace('POSCAR', '')
         with open(os.path.join(path, 'POSCAR'), 'w') as data:
-            data.write(f' - created by mBuild\n'
-                                f'{lattice_const}\n')
+            out = f' - created by mBuild\n' f'{lattice_const}\n'
             for x in self.latmat:
-                data.write(f'{x[0]} {x[1]} {x[2]} \n')
-            data.write((len(atom_names)*'{} ').format(*atom_names)+'\n')
+                out += f'{x[0]} {x[1]} {x[2]} \n'
+            out += (len(atom_names)*'{} ').format(*atom_names)+'\n'
             part_names = [x.name for x in self.particles(0)]
-            data.write((len(atom_names)*'{} ').format(*[part_names.count(y) for y in atom_names])+'\n')
+            out += (len(atom_names)*'{} ').format(*[part_names.count(y) for y in atom_names])+'\n'
 
             if fixed_atoms:
-                data.write('Selective Dyn\n')
-            data.write(coord+'\n')
+                out += 'Selective Dyn\n'
+            out += coord+'\n'
 
             for p in self.particles_label_sorted():
-                data.write('{0:.13f} {1:.13f} {2:.13f} '.format(*p.pos))
+                out += '{0:.13f} {1:.13f} {2:.13f} '.format(*p.pos)
                 if fixed_atoms:
-                    data.write(' '.join(3*['F' if p in fixed_atoms else 'T'])+'\n')
+                    out += ' '.join(3*['F' if p in fixed_atoms else 'T'])+'\n'
                 else:
-                    data.write('\n')
+                    out += '\n'
+            data.write(out)
+        return out
 
     def particles_in_range(
             self,
@@ -878,7 +895,7 @@ class Compound(object):
         return c1, c2, c3
 
     def closest_img_dihed(self, p1, p2, p3, p4):
-        ''' input three particles, get back three coordinates '''
+        ''' input four particles, get back four coordinates '''
         c1, c2, c3 = self.closest_img_angle(p1, p2, p3)
         c4 = self.neighbs(c3, p4, closest_img=1)[0]
         return c1, c2, c3, c4
@@ -2311,7 +2328,7 @@ class Compound(object):
         if self.children:
             descr.append('{:d} particles, '.format(self.n_particles(1)))
         else:
-            descr.append('pos=({: .4f},{: .4f},{: .4f}), '.format(*self.pos))
+            descr.append('pos=[{: .4f},{: .4f},{: .4f}], '.format(*self.pos))
 
         # descr.append('{:d} bonds, '.format(self.n_bonds))
 
@@ -2660,35 +2677,42 @@ class Compound(object):
                         propers.add(tuple([x for x in ipath]))
         return self.bond_graph.edges, angles, propers
     
+    
     def create_bonding_all(self, kb=300, ka=500, kd=500, acfpath=None):
         import pymatgen.core.periodic_table as pt
         # ff = ElementTree(element=Element('ForceField'))
         types = equivalence_classes(self.particles_label_sorted(), lambda x,y: x.name==y.name)
         # atom_type = SubElement(ff.getroot(), 'AtomTypes')
-        self.ff = FF()
-        # aa = [[ 89.  , 227.03], [ 47.  , 107.87], [ 13.  ,  26.98], [ 95.  , 243.  ], [ 18.  ,  39.95], [ 33.  ,  74.92], [ 85.  , 210.  ], [ 79.  , 196.97], [  5.  ,  10.81], [ 56.  , 137.33], [  4.  ,   9.01], [ 83.  , 208.98], [ 97.  , 247.  ], [ 35.  ,  79.9 ], [  6.  ,  12.01], [ 20.  ,  40.08], [ 48.  , 112.41], [ 58.  , 140.12], [ 98.  , 251.  ], [ 17.  ,  35.45], [ 96.  , 247.  ], [ 27.  ,  58.93], [ 24.  ,  52.  ], [ 55.  , 132.91], [ 29.  ,  63.55], [ 66.  , 162.5 ], [ 68.  , 167.26], [ 99.  , 252.  ], [ 63.  , 151.97], [  9.  ,  19.  ], [ 26.  ,  55.85], [100.  , 257.  ], [ 87.  , 223.  ], [ 31.  ,  69.72], [ 64.  , 157.25], [ 32.  ,  72.61], [  1.  ,   1.01], [105.  , 260.  ], [  2.  ,   4.  ], [ 72.  , 178.49], [ 80.  , 200.59], [ 67.  , 164.93], [ 53.  , 126.91], [ 49.  , 114.82], [ 77.  , 192.22], [ 19.  ,  39.1 ], [ 36.  ,  83.8 ], [ 57.  , 138.91], [  3.  ,   6.94], [103.  , 260.  ], [ 71.  , 174.97], [101.  , 258.  ], [ 12.  ,  24.31], [ 25.  ,  54.94], [ 42.  ,  95.94], [  7.  ,  14.01], [ 11.  ,  22.99], [ 41.  ,  92.91], [ 60.  , 144.24], [ 10.  ,  20.18], [ 28.  ,  58.69], [102.  , 259.  ], [ 93.  , 237.05], [  8.  ,  16.  ], [ 76.  , 190.2 ], [ 15.  ,  30.97], [ 91.  , 231.04], [ 82.  , 207.2 ], [ 46.  , 106.42], [ 61.  , 145.  ], [ 84.  , 209.  ], [ 59.  , 140.91], [ 78.  , 195.08], [ 94.  , 244.  ], [ 88.  , 226.03], [ 37.  ,  85.47], [ 75.  , 186.21], [104.  , 261.  ], [ 45.  , 102.91], [ 86.  , 222.  ], [ 44.  , 101.07], [ 16.  ,  32.07], [ 51.  , 121.75], [ 21.  ,  44.96], [ 34.  ,  78.96], [ 14.  ,  28.09], [ 62.  , 150.36], [ 50.  , 118.71], [ 38.  ,  87.62], [ 73.  , 180.95], [ 65.  , 158.93], [ 43.  ,  98.  ], [ 52.  , 127.6 ], [ 90.  , 232.04], [ 22.  ,  47.88], [ 81.  , 204.38], [ 69.  , 168.93], [ 92.  , 238.03], [ 23.  ,  50.94], [ 74.  , 183.85], [ 54.  , 131.29], [ 39.  ,  88.91], [ 70.  , 173.04], [ 30.  ,  65.39], [ 40.  ,  91.22], [106.  ,   2.01]]
-        # aa = {x[0]:x[1] for x in aa}
-
-        chg = check_output(''' awk 'BEGIN{flg=0};/--/{getline;flg=!flg}flg{print $5}' '''+os.path.join(acfpath,'ACF.dat'), shell=1)
-        chg = np.genfromtxt(io.BytesIO(chg))
-        elemchg = {'Ca': 8, 'H': 1, 'O': 6, 'Si': 4, 'C': 4}  # Ca, H, O, Si, C
-
         for x in types:
             mass = pt.Element(x[0].name).atomic_mass
             for i, atom in enumerate(x, 1):
                 nme = atom.name+str(i)
-                atom.type = {'name':nme, 'mass':str(mass.real), 'element':atom.name, 'charge':str(elemchg[atom.name] - chg[i])}
+                atom.type = {'name':nme, 'mass':str(mass.real), 'element':atom.name}
                 self.ff.atom_types.append(atom.type)
+        # aa = [[ 89.  , 227.03], [ 47.  , 107.87], [ 13.  ,  26.98], [ 95.  , 243.  ], [ 18.  ,  39.95], [ 33.  ,  74.92], [ 85.  , 210.  ], [ 79.  , 196.97], [  5.  ,  10.81], [ 56.  , 137.33], [  4.  ,   9.01], [ 83.  , 208.98], [ 97.  , 247.  ], [ 35.  ,  79.9 ], [  6.  ,  12.01], [ 20.  ,  40.08], [ 48.  , 112.41], [ 58.  , 140.12], [ 98.  , 251.  ], [ 17.  ,  35.45], [ 96.  , 247.  ], [ 27.  ,  58.93], [ 24.  ,  52.  ], [ 55.  , 132.91], [ 29.  ,  63.55], [ 66.  , 162.5 ], [ 68.  , 167.26], [ 99.  , 252.  ], [ 63.  , 151.97], [  9.  ,  19.  ], [ 26.  ,  55.85], [100.  , 257.  ], [ 87.  , 223.  ], [ 31.  ,  69.72], [ 64.  , 157.25], [ 32.  ,  72.61], [  1.  ,   1.01], [105.  , 260.  ], [  2.  ,   4.  ], [ 72.  , 178.49], [ 80.  , 200.59], [ 67.  , 164.93], [ 53.  , 126.91], [ 49.  , 114.82], [ 77.  , 192.22], [ 19.  ,  39.1 ], [ 36.  ,  83.8 ], [ 57.  , 138.91], [  3.  ,   6.94], [103.  , 260.  ], [ 71.  , 174.97], [101.  , 258.  ], [ 12.  ,  24.31], [ 25.  ,  54.94], [ 42.  ,  95.94], [  7.  ,  14.01], [ 11.  ,  22.99], [ 41.  ,  92.91], [ 60.  , 144.24], [ 10.  ,  20.18], [ 28.  ,  58.69], [102.  , 259.  ], [ 93.  , 237.05], [  8.  ,  16.  ], [ 76.  , 190.2 ], [ 15.  ,  30.97], [ 91.  , 231.04], [ 82.  , 207.2 ], [ 46.  , 106.42], [ 61.  , 145.  ], [ 84.  , 209.  ], [ 59.  , 140.91], [ 78.  , 195.08], [ 94.  , 244.  ], [ 88.  , 226.03], [ 37.  ,  85.47], [ 75.  , 186.21], [104.  , 261.  ], [ 45.  , 102.91], [ 86.  , 222.  ], [ 44.  , 101.07], [ 16.  ,  32.07], [ 51.  , 121.75], [ 21.  ,  44.96], [ 34.  ,  78.96], [ 14.  ,  28.09], [ 62.  , 150.36], [ 50.  , 118.71], [ 38.  ,  87.62], [ 73.  , 180.95], [ 65.  , 158.93], [ 43.  ,  98.  ], [ 52.  , 127.6 ], [ 90.  , 232.04], [ 22.  ,  47.88], [ 81.  , 204.38], [ 69.  , 168.93], [ 92.  , 238.03], [ 23.  ,  50.94], [ 74.  , 183.85], [ 54.  , 131.29], [ 39.  ,  88.91], [ 70.  , 173.04], [ 30.  ,  65.39], [ 40.  ,  91.22], [106.  ,   2.01]]
+        # aa = {x[0]:x[1] for x in aa}
+        """ this parts reads bader charges
+        if acfpath:
+            chg = check_output(''' awk 'BEGIN{flg=0};/--/{getline;flg=!flg}flg{print $5}' '''+os.path.join(acfpath,'ACF.dat'), shell=1)
+            chg = np.genfromtxt(io.BytesIO(chg))
+            elemchg = {'Ca': 8, 'H': 1, 'O': 6, 'Si': 4, 'C': 4}  # Ca, H, O, Si, C
 
-        self.bonds_typed = OrderedDict()
-        self.angles_typed = OrderedDict()
-        self.propers_typed = OrderedDict()
+        if acfpath:
+            for i, atom in enumerate(self.particles_label_sorted()):
+                atom.type['charge'] = str(elemchg[atom.name] - chg[i])
+        """
+        if acfpath:
+            with open(os.path.join(acfpath,'DDEC6_even_tempered_net_atomic_charges.xyz'), 'r') as f:
+                charges = np.zeros(self.n_particles())
+                lines = f.readlines()
+                for i, atom in enumerate(self.particles_label_sorted()):
+                    atom.type['charge'] = lines[2+i].split()[-1]
 
         bonds, angles, propers = self.network_b_a_d()
         for x in bonds:
             # if cnt==1:
             mag = bond_length(self.closest_img_bond(*x), 0)
-            self.ff.bond_types.append({'k':str(kb), 'length':str(mag[0]), 'type1':x[0].type['name'], 'type2':x[1].type['name']})
+            self.ff.bond_types.append(defaultdict(lambda:'', {'k':str(kb), 'rest':str(mag[0]), 'type1':x[0].type['name'], 'type2':x[1].type['name']}))
             self.bonds_typed[x] = self.ff.bond_types[-1]
             # cnt += 1
 
@@ -2696,7 +2720,7 @@ class Compound(object):
             mag = bend_angle(self.closest_img_angle(*x), 0)
             if np.isclose(mag, np.pi, atol=.001, rtol=0) or np.isclose(mag, 0, atol=.001):
                 continue
-            self.ff.angle_types.append({'k':str(ka), 'angle':str(math.degrees(mag[0])), 'type1':x[0].type['name'], 'type2':x[1].type['name'], 'type3':x[2].type['name']})
+            self.ff.angle_types.append(defaultdict(lambda:'', {'k':str(ka), 'rest':str(math.degrees(mag[0])), 'type1':x[0].type['name'], 'type2':x[1].type['name'], 'type3':x[2].type['name']}))
             self.angles_typed[x] = self.ff.angle_types[-1]
 
         for x in propers:
@@ -2711,11 +2735,11 @@ class Compound(object):
             if close(cv1, 0) or close(cv2, 0):
                 continue
             mag = dihed_angle(coords, 0)
-            if close(mag, 0) or close(np.abs(mag), np.pi):
-                continue
+            # if close(mag, 0) or close(np.abs(mag), np.pi):
+            #     continue
                 
-            self.ff.proper_types.append({'k':str(kd), 'phi':str(math.degrees(abs(mag[0]))), 'type1':x[0].type['name'],
-                                        'type2':x[1].type['name'], 'type3':x[2].type['name'], 'type4':x[3].type['name']})
+            self.ff.proper_types.append(defaultdict(lambda:'', {'k':str(kd), 'rest':str(math.degrees((mag[0]))), 'type1':x[0].type['name'],
+                                        'type2':x[1].type['name'], 'type3':x[2].type['name'], 'type4':x[3].type['name']}))
             self.propers_typed[x] = self.ff.proper_types[-1]
 
 
@@ -2764,8 +2788,8 @@ class Compound(object):
         nlst = self.particles_label_sorted()
         n = self.n_particles()
         qlist = [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
-        B=np.zeros([3*n-6, 3*n])
-        grad = np.zeros(3*n-6)
+        B=np.zeros([len(qlist), 3*n]) #in a determinate structure, len(qlist) = 3*n-6
+        grad = np.zeros(len(qlist))
         hessian = np.zeros([3*n, 3*n])
         K = deepcopy(hessian)
         for cnt, x in enumerate(qlist):
@@ -2796,17 +2820,34 @@ class Compound(object):
                 sderiv *= -1
 
             sderiv = sderiv.reshape([-1, 3 * len(x)])
-            if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
-                                np.isclose(mag, np.pi, atol=1e-15, rtol=0)): #or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
-                fderiv = np.zeros(fderiv.shape)
-                sderiv = np.zeros(sderiv.shape)
+            # if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
+            #                     np.isclose(mag, np.pi, atol=1e-15, rtol=0)): #or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
+            #     fderiv = np.zeros(fderiv.shape)
+            #     sderiv = np.zeros(sderiv.shape)
             hessian[np.ix_(idx, idx)] = sderiv * 2 * k * (mag - mag0)
             K += hessian
         return B, K
 
-
-    def hessx_to_internal(self, Hx):
+    def get_stiffnesses(self, Hx, hx):
         B, K = self.getB()
+
+        idx,_ = rm_dependent_rows(hx)
+        B = B[:, idx]
+        K = K[np.ix_(idx, idx)]
+        Hx = Hx[np.ix_(idx, idx)]
+
+        return inv(B.T**2) @ np.diag(Hx)
+
+
+    def hessx_to_internal(self, Hx, hx=None):
+        '''hx: the hessian that should be used to remove DoFs to make the structure stable'''
+        B, K = self.getB()
+        if hx is not None:
+            idx,_ = rm_dependent_rows(hx)
+            B = B[:, idx]
+            K = K[np.ix_(idx, idx)]
+            Hx = Hx[np.ix_(idx, idx)]
+        
 
         Binv = np.linalg.pinv(B)
 
@@ -2881,9 +2922,6 @@ class Compound(object):
 
         # create angles and dihedrals
         self.gen_angs_and_diheds()
-
-        self.nonbond_typed = OrderedDict()
-        self.bonds_typed = OrderedDict()
 
         for p in self.particles():
             for nb_type in self.ff.nonbond_types:
@@ -2968,7 +3006,7 @@ class Compound(object):
             data.write('\nBond Coeffs # harmonic\n')
             data.write('#\tk(kcal/mol/angstrom^2)\t\treq(angstrom)\n')
             for i,y in enumerate(self.ff.bond_types,1):
-                data.write(f"{i}\t{y['k'] if bond else 0}\t{y['length']}\t# {y['type1']}\t{y['type2']}\n")
+                data.write(f"{i}\t{y['k'] if bond else 0}\t{y['rest']}\t# {y['type1']}\t{y['type2']}\n")
 
             # Angle coefficients
             if self.ff.angle_types:
@@ -3007,10 +3045,18 @@ class Compound(object):
             comps = list(nx.connected_components(self.bond_graph))
 
             for i,p in enumerate(nlst,1):
+                try:
+                    chg = [x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0]
+                except:
+                    try:
+                        chg = float(p.type['charge'])
+                    except:
+                        chg = p.charge
+
                 data.write(atom_line.format(
                     index=i,type_index=self.ff.atom_types.index(p.type)+1,
                     zero=[i for i in range(len(comps)) if p in comps[i]][0],
-                    charge=[x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0] if elec else 0,
+                    charge=chg if elec else 0,
                     x=p.pos[0],y=p.pos[1],z=p.pos[2],t=p.type['name']))
 
             if atom_style in ['full', 'molecular']:
@@ -3018,7 +3064,7 @@ class Compound(object):
                 # if bond:
                 data.write('\nBonds\n\n')
                 for i,bond in enumerate(self.bonds_typed.items(),1):
-                    bidx=[nlst.index(j)+1 for j in bond[0]]
+                    bidx = [nlst.index(j)+1 for j in bond[0]]
                     data.write(f"{i}\t{self.ff.bond_types.index(bond[1])+1}\t"
                                f"{bidx[0]}\t{bidx[1]}\n")
 
@@ -3290,7 +3336,12 @@ end structure
         total_dipole = 0.0
         for i, p in enumerate(particles):
             total_dipole += eval([x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0]) * p.pos[dir] 
-        return total_dipole        
+        return total_dipole     
+    
+    
+    @property
+    def elems(self):
+        return OrderedSet([x.name for x in self.particles_label_sorted()])
     
 
     def neutralize(self, types=None):
@@ -3308,54 +3359,119 @@ end structure
                 if x['name'] == y['type']:
                    y['charge'] = str(float(y['charge']) + adjust)
 
-    def write_gulp(self, direc='.', ordered=1,
-                   keys='''opti conp molmec fix noautobond nosym norepulsive_cutoff prop thermal  & \nfreq  eigen lower optlower kcal conj\n\n'''):
-
+    def write_gulp(self, direc='.', ordered=1, misc='', coords=None, obs=None, obs_atoms=None,
+                   keys='''opti conp molmec fix noautobond nosym norepulsive_cutoff prop thermal  & \nfreq  eigen lower optlower kcal conj\n\n'''
+                   ,opts=''):
+        parts = self.particles_label_sorted()
+        if not obs_atoms:
+            obs_atoms = parts
+        fit = 'fit' in keys
         types = equivalence_classes(self.ff.atom_types, lambda x,y: x['element']==y['element'])
         
         type_map = dict()
         for x in types:
             for i,y in enumerate(x, 1):
                 type_map[y['name']] = y['element']+str(i)
-        with open(os.path.join(direc, 'gulp.in'), 'w') as f:
-            f.write(keys)
-            f.write('\n\nelement\n')
-            for x in types:
-                f.write(f"mass {x[0]['element']} {x[0]['mass']}\n")
-            f.write("end \n\nvector\n")
-            f.write((3*(3*'{} '+'\n')).format(*self.latmat.flatten()))
-            
-            f.write('\ncart\n')
-            for x in self.particles_label_sorted() if ordered else self.particles():
-                f.write(f'{type_map[x.type["name"]]:4}' + (3*'{:7f}  '+'\n').format(*x.pos))
+        out = keys
+        out += '\n\nelement\n'
+        for x in types:
+            out += f"mass {x[0]['element']} {x[0]['mass']}\n"
+        out += 'end \n'
 
-            f.write('\n')
+
+        if coords is None:
+            coords = [self.xyz_label_sorted if ordered else self.xyz]
+            frcs = [np.zeros(coords[0].shape)]
+        for cnt, (frame, frc) in enumerate(zip(coords, obs), 1):
+            out += f"\nvector  # config  {cnt}\n"
+            out += (3*(3*'{} '+'\n')).format(*self.latmat.flatten())
+            if fit:
+                out += ' 0  0  0  0  0  0'
+            out += '\ncart\n'
+            for x, y in zip(parts, frame):
+                out += f'{type_map[x.type["name"]]:4}' + (3*'{:7f}  ' + '{} ').format(*y, x.type['charge'])
+                if fit:
+                    out += ' 1 1 1 \n' if x in obs_atoms else ' 0 0 0 \n'
+                else:
+                    out += '\n'
+
+            out += '\n'
             bonds,_ = self.bonds_angles_index()
             for x in bonds + 1:
-                f.write('connect {} {}\n'.format(*x))
+                out += 'connect {} {}\n'.format(*x)
 
-            if self.ff.nonbond_types:
-                f.write("\nepsilon/sigma kcal\n")
-                for x in self.ff.nonbond_types:
-                    f.write(f"{type_map[x['type']]}  {x['epsilon']}  {x['sigma']} \n")
+            if fit:
+                out += '\nobservables\n'
+                if 'obsener' in misc:
+                    out += f'energy \n{obs[cnt-1]} \n'
+                else:
+                    out += 'gradient ev/angs\n'
+                    frc = [np.insert(y, 0, parts.index(x) + 1) for x, y in zip(obs_atoms, frc)]
+                    for x in frc:
+                        out += ('{:<4d} ' + 3 * '{:<10.6e}  ').format(int(x[0]), *x[1:]) + '\n'
 
-                f.write("\nlenn epsilon zero product 12  6 x13 kcal all\n")
-                f.write('12\n')
-                
-            f.write("\nharmonic intra bond kcal\n" if self.ff.bond_types else '')
-            for x in self.ff.bond_types:
-                f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {2*float(x['k'])}  {x['length']}  0   \t# {x['type1']}\t{x['type2']}\n")
+                out += 'end\n'
 
-            f.write("\nthree bond intra regular kcal\n" if self.ff.angle_types else '')
-            for x in self.ff.angle_types:
-                f.write(f"{type_map[x['type2']]} {type_map[x['type1']]}  {type_map[x['type3']]}  {2*float(x['k'])}  {x['angle']}  \t# {x['type1']}\t{x['type2']}\t{x['type3']}\n")
+                #if you want to set weights instead
+                #                     for cc, x, y in zip(range(1, len(frc)+1), parts, frc):
+                #     f.write(f'{cc:<4d} ' + (3*'{:<10.6e}  ').format(*y) + (' 1 ' if x in obs_atoms else '0 ') + '\n')
+                # f.write('end\n')
 
-            f.write('\n torharm intra bond kcal\n' if self.ff.proper_types else '')
-            for x in self.ff.proper_types:
-                keys = [y for y in x.keys() if 'type' not in y]
-                f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]} {type_map[x['type4']]} "+ (len(keys)*'{} ').format(*[x[z] for z in keys]) +f"\t# {x['type1']}\t{x['type2']}\t{x['type3']}\t{x['type4']}\n")
-            f.write('\n slower .05')
-            f.write('\noutput movie xyz')
+        if 'lenn' in self.ff.pair_style:
+            if 'atomab' in misc:
+                atoms = ['Ca', 'H', 'O', 'Si', 'C']
+                params = np.array([119025, 7108.466, 272894.7846, 3149175, 1981049.225])/10
+                out += "\natomab\n"
+            else:
+                out += "\nepsilon/sigma kcal\n"
+            for x in self.ff.nonbond_types:
+                    out += f"{x['name']}  {x['eps_or_a']}  {x['sig_or_b']} " + (' 0 0 \n' if 'fit' in keys else '\n')
+
+            out += "\nlenn x14 kcal all" + (' combine\n' if 'atomab' in misc else '  epsilon zero product\n')
+            out += '12\n'
+        if 'grimme' in self.ff.pair_style:
+            out += '\ngrimme_c6 x14 kcal\n'
+            indices = [20, 1, 8, 14, 6]
+            conversion = 10.364425449557316
+            atoms = ['Ca', 'H', 'O', 'Si', 'C']
+
+            cc = dict(zip(atoms, [10.8, 0.14, 0.7, 9.23, 1.75]))
+            r0 = dict(zip(atoms, [1.474, 1.001, 1.342, 1.716, 1.452]))
+
+            for x in atoms:
+                cc[x] = (cc[x] * u.joule * u.nanometer ** 6).in_units_of(u.angstrom ** 6 * u.kilocalorie)._value
+
+            n = len(atoms)
+            for i in range(n):
+                for j in range(i, n):
+                    t1, t2 = atoms[i], atoms[j]
+
+                    rr0 = r0[t1] + r0[t2]
+                    ccc = np.sqrt(cc[t1] * cc[t2])
+                    out += f'{t1}  {t2}  {0.75*ccc:<12.5f}  20.0  {rr0:<12.5f}  12 ' + (' 0  0 0\n' if 'fit' in keys else '\n')     #0.75 = s_6
+
+        out += "\nharmonic intra bond kcal\n" if self.ff.bond_types else ''
+        for cnt, x in enumerate(self.ff.bond_types, 1):
+            out += f"{type_map[x['type1']]} {type_map[x['type2']]}  "\
+                    f"{2*float(x['k'])}  {x['rest']}  0  {x['f1']} {x['f2']} \t#{cnt}: {x['type1']}\t{x['type2']}\n"
+
+        out += "\nthree bond intra regular kcal\n" if self.ff.angle_types else ''
+        for cnt, x in enumerate(self.ff.angle_types, 1):
+            out += f"{type_map[x['type2']]} {type_map[x['type1']]}  {type_map[x['type3']]}  "\
+                    f"{2*float(x['k'])}  {x['rest']}  {x['f1']} {x['f2']} \t#{cnt}: {x['type1']}\t{x['type2']}\t{x['type3']}\n"
+
+        out += '\ntorharm intra bond kcal\n' if self.ff.proper_types else ''
+        for cnt, x in enumerate(self.ff.proper_types, 1):
+            kk = [y for y in x.keys() if 'type' not in y]
+            out += f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]} {type_map[x['type4']]} "\
+                    f"{2 * float(x['k'])}  {x['rest'].replace('-','')}" + f" {x['f1']} {x['f2']} " \
+                    f"\t#{cnt}: {x['type1']}\t{x['type2']}\t{x['type3']}\t{x['type4']}\n"
+        # out += '\n slower .05'
+        # out += '\noutput movie xyz'
+        out += opts
+
+        open(os.path.join(direc, 'gulp.in'), 'w') .write(out)
+        return out
 
 
     def rotate_vecs(self, v1, v2, pnt=None):
@@ -3508,6 +3624,10 @@ class FF():
     def __init__(self):
         
         self.atom_types,self.nonbond_types,self.bond_types,self.angle_types,self.proper_types = [[], [], [], [], []]
+        self.pair_style = ''
+        self.bond_style = ''
+        self.angle_style = ''
+        self.dihedral_style = ''
         
     def read_xml(self, file):
         # start of my additions:
