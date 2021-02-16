@@ -1,19 +1,22 @@
 import numpy as np
 from collections.abc import Iterable
-from collections import OrderedDict, defaultdict
-from ismember import ismember
+from collections import OrderedDict, defaultdict, Counter
+# from ismember import ismember
 from copy import deepcopy
-import os, math#, sys, tempfile, importlib
+import os, math  # , sys, tempfile, importlib
 # from warnings import warn
 from itertools import chain, compress, combinations
-#
+import regex as re
 #
 import parmed as pmd
 from scipy.spatial.transform import Rotation as R
 from parmed.periodic_table import AtomicNum, element_by_name, Mass, Element
 from funcs import *
-from openbabel import pybel,openbabel
+# from openbabel import pybel,openbabel
+import dill
+# nx = dill.load(open('nx', 'rb'))
 import networkx as nx
+
 from molmod.ic import bond_length, bend_angle, dihed_angle
 
 # from pymatgen.core import Structure
@@ -27,23 +30,114 @@ from numpy.linalg import inv, norm, det, matrix_rank
 # from collections import defaultdict
 from orderedset import OrderedSet
 
-#to do list:
-# ForceField from foyer should be in this file somehow
-# nonbond types should have somethig similar to bonds_typed (maybe add 'nonbond' to each atom)
+
+# (data.write\()(.*(?=\)))\) # to replace data.write(foo) with out += foo
+
+def from_gulp(direc='gulp.in'):
+    comp = Compound()
+    st = np.ones(10)
+    f = open(direc)
+    masses = {}
+    for ln in f:
+        re.sub('#.*', '', ln)
+        if 'mass' in ln:
+            masses[get_cols(ln, 2)] = float(get_cols(ln, 3))
+        if 'vect' in ln and st[0]:
+            cnt = 0
+            txt = ''
+            for x in f:
+                if x.strip():
+                    cnt += 1
+                    txt += x
+                    if cnt == 3:
+                        break
+            comp.latmat = txt_to_mat(txt)
+            st[0] = 0
+        if 'cart' in ln and st[1]:
+            flg = 0
+            for x in f:
+                if not x.strip() and flg == 0:
+                    continue
+                flg = 1
+                if not x.strip():
+                    break
+                fs = x.split()
+                t = Compound(fs[0], pos=np.array(fs[1:4], dtype=float))
+                t.charge = float(fs[-1])
+                t.elem = re.sub('\d+', '', fs[0])
+                t.mass = masses[t.elem]
+                comp.add(t)
+            parts = comp.particles()
+            st[1] = 0
+
+        if 'conn' in ln and st[2]:
+            for x in chain([ln], f):
+                if 'conn' not in x:
+                    break
+                idx = np.array(x.split()[1:], dtype=int) - 1
+                comp.add_bond([parts[i] for i in idx])
+            st[2] = 0
+            bonds, angles, propers = comp.network_b_a_d()
+
+        if 'grimme' in ln:
+            for x in chain([skip_blanks(f)], f):
+                if not x.strip():
+                    break
+                comp.ff.nonbond_types.append(
+                    dict(zip(['type1', 'type2', 'c6', 'd', 'r0'], get_cols(x, [*range(1, 6)]))))
+
+        if 'atomab' in ln:
+            for x in chain([skip_blanks(f)], f):
+                if not x.strip():
+                    break
+                comp.ff.nonbond_types.append(dict(zip(['type', 'a', 'b'], get_cols(x, [*range(1, 4)]))))
+
+        def func(n, f):
+            types = [f'type{i}' for i in range(1, n + 1)]
+            for x in f:
+                # x = skip_blanks(f)
+                if not x.strip():
+                    break
+                x = x.split()
+                t = np.roll(types, -1 if n == 3 else 0)
+                v1.append(dict(zip([*t, 'k', 'r0', 'f1', 'f2'], x[:2 + n] + [0, 0])))
+            for x in v3:
+                for y in v1:
+                    if Counter([y.name for y in x]) == Counter([y[g] for g in types]):
+                        v2[x] = y
+                        break
+
+        if 'harmonic' in ln:
+            v1, v2, v3 = comp.ff.bond_types, comp.bonds_typed, bonds
+            func(2, f)
+
+        if 'three' in ln:
+            v1, v2, v3 = comp.ff.angle_types, comp.angles_typed, angles
+            func(3, f)
+
+        if 'torharm' in ln:
+            v1, v2, v3 = comp.ff.proper_types, comp.propers_typed, propers
+            func(4, f)
+    return comp
+
 
 def from_pymatgen(structure):
     """ convert pymatgen structure to compound """
 
     comp = Compound(names=[x.specie.name for x in structure.sites], pos=structure.cart_coords)
+    # for x in comp:
+    #     x.elem = x.name
     comp.latmat = structure.lattice.matrix
     comp.latmat.setflags(write=1)
+
+    for x, y in zip(structure.sites, comp.particles()):
+        y.mass = x.specie.atomic_mass.real
 
     return comp
 
 
 def compload(filename_or_object, relative_to_module=None, compound=None, coords_only=False,
-         use_parmed=False, smiles=False,
-         infer_hierarchy=True, **kwargs):
+             use_parmed=False, smiles=False, ad_names=1, **kwargs):
     """Load a file or an existing topology into an mbuild compound.
 
     Files are read using the MDTraj package unless the `use_parmed` argument is
@@ -53,6 +147,8 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
 
     Parameters
     ----------
+    ad_names = adjust names of elements read in
+
     filename_or_object : str, mdtraj.Trajectory, parmed.Structure, mbuild.Compound,
             pybel.Molecule
         Name of the file or topology from which to load atom and bond information.
@@ -65,8 +161,6 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
     smiles: bool, optional, default=False
         Use Open Babel to parse filename as a SMILES string
         or file containing a SMILES string.
-    infer_hierarchy : bool, optional, default=True
-        If True, infer hierarchy from chains and residues
     **kwargs : keyword arguments
         Key word arguments passed to mdTraj for loading.
 
@@ -79,20 +173,20 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
     from pymatgen.core import Structure
     # If compound doesn't exist, we will initialize one
     if compound is None:
-        compound = Compound()
+        compound = Compound(adj_names=1)
 
     # First check if we are loading from an existing parmed or trajectory structure
     type_dict = {
-        pmd.Structure:compound.from_parmed,
-        md.Trajectory:compound.from_trajectory,
-    }#pybel.Molecule:compound.from_pybel
+        pmd.Structure: compound.from_parmed,
+        md.Trajectory: compound.from_trajectory,
+    }  # pybel.Molecule:compound.from_pybel
 
     if isinstance(filename_or_object, Compound):
         return filename_or_object
     for type in type_dict:
         if isinstance(filename_or_object, type):
-            type_dict[type](filename_or_object,coords_only=coords_only,
-                    infer_hierarchy=infer_hierarchy, **kwargs)
+            type_dict[type](filename_or_object, coords_only=coords_only,
+                            infer_hierarchy=infer_hierarchy, **kwargs)
 
     # Handle mbuild2 *.py files containing a class that wraps a structure file
     # in its own folder. E.g., you build a system from ~/foo.py and it imports
@@ -131,18 +225,23 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
         compound.from_pybel(pybel_mol[0])
 
     if 'POSCAR' in filename_or_object or 'CONTCAR' in filename_or_object:
-        return from_pymatgen(Structure.from_file(filename_or_object))
+        compound = from_pymatgen(Structure.from_file(filename_or_object))
+        cdir = re.sub(r'[^/]+$', 'DDEC6_even_tempered_net_atomic_charges.xyz', filename_or_object)
+        if Path(cdir).exists():
+            file = open(cdir).readlines()
+            for p, x in zip(compound.particles(), file[2:2+int(file[0])]):
+                p.charge = float(get_cols(x, 5))
 
-    if extension == '.cif':
-        return from_pymatgen(Structure.from_file(filename_or_object)) #type: Compound
+    elif extension == '.cif':
+        compound = from_pymatgen(Structure.from_file(filename_or_object))  # type: Compound
 
-    if use_parmed:
+    elif use_parmed:
         # warn(
         #     "use_parmed set to True.  Bonds may be inferred from inter-particle "
         #     "distances and standard residue templates!")
         structure = pmd.load_file(filename_or_object, structure=True, **kwargs)
         compound.from_parmed(structure, coords_only=coords_only,
-                infer_hierarchy=infer_hierarchy)
+                             infer_hierarchy=infer_hierarchy)
 
     elif smiles:
         # First we try treating filename_or_object as a SMILES string
@@ -175,9 +274,12 @@ def compload(filename_or_object, relative_to_module=None, compound=None, coords_
         traj = md.load(filename_or_object, **kwargs)
         # traj.xyz*=10
         if extension in ['.pdb', '.mol2']:
-            traj.xyz*=10
+            traj.xyz *= 10
 
-        compound.from_trajectory(traj, frame=-1, infer_hierarchy=infer_hierarchy)
+        compound.from_trajectory(traj, frame=-1, infer_hierarchy=0)
+
+    if ad_names:
+        compound.unique_names()
 
     return compound
 
@@ -208,22 +310,41 @@ def clone(existing_compound, clone_of=None, root_container=None):
     existing_compound._clone_bonds(clone_of=clone_of)
     return newone
 
-def from_lmps_data(direc='data.dat'):
+
+def from_lmps_data(direc='data.dat', atom_style="full"):
     from pymatgen.io.lammps.data import LammpsData
-    aa = LammpsData.from_file(direc)
+    aa = LammpsData.from_file(direc, atom_style)
     comp = from_pymatgen(aa.structure)
 
-    _,_,bb=aa.disassemble(guess_element=1)
+    if atom_style == 'full':
+        charges = aa.structure.site_properties['charge']
+        for i, x in enumerate(comp.particles()):
+            x.charge = charges[i]
 
-    for x in bb[0].topologies['Bonds']:
-        comp.add_bond(comp[x])
-    
+    _, _, bb = aa.disassemble(guess_element=1)
+
+    if tmp := bb[0].topologies:
+        for x in tmp['Bonds']:
+            comp.add_bond(comp[x])
+
+    f = open(direc)
+    for x in f:
+        if 'atom types' in x:
+            nt = int(get_cols(x, 1))
+        if 'Mass' in x:
+            cnt = 0
+            for y in f:
+                if re.sub('#.*', '', y).strip():
+                    comp.ff.atom_types.append({'name': get_cols(y, 3), 'mass': get_cols(y, 1)})
+                    cnt += 1
+                    if cnt == nt:
+                        break
+
     return comp
-    
+
 
 class Compound(object):
-    """A building block in the mbuild2 hierarchy.
-
+    """
     The design of Compound follows the Composite design pattern (Gamma, Erich; Richard Helm; Ralph Johnson; John
     M. Vlissides (1995). Design Patterns: Elements of Reusable Object-Oriented
     Software. Addison-Wesley. p. 395. ISBN 0-201-63361-2.), with Compound being
@@ -244,9 +365,12 @@ class Compound(object):
         The position of the Compound in Cartestian space
     """
 
-    def __init__(self, name='comp', names=None, pos=None):
+    def __init__(self, name='comp', names=None, pos=None, atoms=[], latmat=np.eye(3), adj_names=1):
+        ''' atoms: list of single compounds '''
 
         self.name = name
+        self.stm_cnt = dict()
+
         pos = np.array(pos)
         if not np.array_equal(pos, None) and (pos.ndim == 1 or pos.shape[0] == 1):
             self._pos = pos.flatten()
@@ -255,23 +379,47 @@ class Compound(object):
 
         self.parent = None
         self.children = OrderedSet()
-        self.referrers = set()
         self.type = []
 
         self.bond_graph = None
+        self.bonds = []
+        self.angles = []
+        self.diheds = []
+        # self.nonbond_typed = OrderedDict()
+        # self.bonds_typed = OrderedDict()
+        # self.angles_typed = OrderedDict()
+        # self.propers_typed = OrderedDict()
 
-        self._latmat = np.eye(3)
+        self._latmat = latmat
         self.box = Box(self)
-        
+
         if names:
             for x, y in zip(names, pos):
-                self.add(Compound(name=x, pos=y))
-            
-    
+                self.add(Compound(name=x, pos=y, adj_names=adj_names))
+        for x in atoms:
+            self.add(x)
+
+        self.ff = FF()
+
+        if adj_names:
+            self.unique_names()
+
     @property
     def latmat(self):
         return self._latmat
-    
+
+    @property
+    def elem(self):
+        return re.search('[a-zA-Z]+', self.name).group()
+
+    @property
+    def stm(self):
+        return re.search('[^\d]+', self.name).group()
+
+    @property
+    def stml(self):
+        return re.search('[^\d]+', self.name).group().lower()
+
     @latmat.setter
     def latmat(self, vec):
         tmp = np.array(vec).flatten()
@@ -281,13 +429,15 @@ class Compound(object):
             self._latmat = np.diag(tmp)
         else:
             self._latmat = vec
-        
+
     # @staticmethod
-    def reflect(self, pp, pvec):
+    def reflect(self, pp, pvec=None):
         """ image of a point with respect to a plane
-        p: point
-        pp: point in the plane
+        pp: point in the plane. if pvec=None, a list of 3 atoms in the plane
         pvect: normal to the plane"""
+        if pvec is None:
+            pvec = cross(pp[0].pos - pp[1].pos, pp[1].pos - pp[2].pos)
+            pp = pp[0].pos
 
         pp, pvec = map(np.array, [pp, pvec])
         n = pvec / norm(pvec)
@@ -298,12 +448,11 @@ class Compound(object):
             tmp = Compound(pos=x.orientation)
             tmp.reflect(pp, pvec)
             x.orientation = tmp.pos
-    
-    def particles(self,ports=0):
-        return list(self._particles(ports))
-            
 
-    def _particles(self,ports=0):
+    def particles(self, ports=0):
+        return list(self._particles(ports))
+
+    def _particles(self, ports=0):
         """Return all Particles of the Compound.
 
         Parameters
@@ -327,6 +476,20 @@ class Compound(object):
             for leaf in child.particles(ports):
                 yield leaf
 
+    def move(self, p1, p2):
+        '''
+        :param p1: a particle of self or a coordinate
+        :param p2: a particle or a coordinate
+        :return: moves self according to the vector connecting p1 to p2
+        '''
+
+        if isinstance(p1, Compound):
+            p1 = p1.pos
+        if isinstance(p2, Compound):
+            p2 = p2.pos
+        self.xyz_with_ports += p2 - p1
+
+
     def successors(self):
         """Yield Compounds below self in the hierarchy.
 
@@ -345,6 +508,16 @@ class Compound(object):
             for subpart in part.successors():
                 yield subpart
 
+    @property
+    def density(self):
+        # from parmed import unit as u
+        dens = 0
+        for x in self.particles():
+            eln = x.elem #  elem name
+            dens += Mass[eln[0].capitalize()+eln[1:].lower()]
+        return dens/det(self.latmat)*1e30/u.AVOGADRO_CONSTANT_NA._value/1e6  #  gr/cm^3
+
+
     def bonds_angles_index(self, sorted=1):
         bond_list = []
         angle_list = []
@@ -355,7 +528,7 @@ class Compound(object):
             angle_list.append([nlst.index(j) for j in angle])
         return np.array(bond_list), np.array(angle_list)
 
-    def n_particles(self,ports=0):
+    def n_particles(self, ports=0):
         """Return the number of Particles in the Compound.
 
         Returns
@@ -389,6 +562,13 @@ class Compound(object):
             for ancestor in self.parent.ancestors():
                 yield ancestor
 
+    def unique_names(self):
+        a, _ = equivalence_classes(self, lambda x, y: x.stml == y.stml)
+        for x in a:
+            for i, y in enumerate(x):
+                y.name = y.stm + str(i)
+            self.stm_cnt[y.stml] = i
+
     @property
     def root(self):
         """The Compound at the top of self's hierarchy.
@@ -405,8 +585,7 @@ class Compound(object):
         if parent is None:
             return self
         return parent
-    
-    
+
     def prt_bonding(self):
         print('number of bonds: ', len(self.bonds_typed))
         print('number of angles: ', len(self.angles_typed))
@@ -451,7 +630,6 @@ class Compound(object):
                 # sderiv3 = dihed_derivs2(*[v.pos for v in x])
             k = float(k)
 
-
             mag, fderiv, sderiv = fun(img(*x), 2)
             if mag < 0:
                 mag *= -1
@@ -459,69 +637,64 @@ class Compound(object):
 
             sderiv = sderiv.reshape([-1, 3 * len(x)])
             fderiv = fderiv.flatten()
-            if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
-                                np.isclose(mag, np.pi, atol=1e-15, rtol=0) or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
-                fderiv = np.zeros(fderiv.shape)
-                sderiv = np.zeros(sderiv.shape)
+            # if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
+            #                     np.isclose(mag, np.pi, atol=1e-15, rtol=0) or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
+            #     fderiv = np.zeros(fderiv.shape)
+            #     sderiv = np.zeros(sderiv.shape)
             hessian[np.ix_(idx, idx)] += 2 * k * (np.einsum('i,j', fderiv, fderiv) + (mag - eq) * sderiv)
         return hessian
 
     def particles_by_name(self, name):
-        """Return all Particles of the Compound with a specific name
-
-        Parameters
-        ----------
-        name : str
-            Only particles with this name are returned
-
-        Yields
-        ------
-        mb.Compound
-            The next Particle in the Compound with the user-specified name
-
         """
+        name: str or list of str
+        """
+        if not isinstance(name, str):
+            for x in name:
+                self.particles_by_name(x)
         for particle in self.particles(1):
             if particle.name == name:
                 yield particle
 
-    def add(self, new_child, expand=True,name=None,replace=False,
-            inherit_periodicity=True, reset_rigid_ids=True):
+    def add(self, new_child, expand=True, name=None, adj_names=1, cparent=1):
         """Add a part to the Compound.
-
-        Parameters
-        ----------
-        new_child : mb.Compound or list-like of mb.Compound
-            The object(s) to be added to this Compound.
-
+        cparent: change the parent of the atom? For when you want to just select
         """
         # Support batch add via lists, tuples and sets.
-        if (isinstance(new_child, Iterable) and
+        if (not isinstance(new_child, Compound) and
                 not isinstance(new_child, str)):
             for child in new_child:
-                self.add(child, reset_rigid_ids=reset_rigid_ids)
+                self.add(child, expand=expand, adj_names=adj_names)
             return
 
-        if not isinstance(new_child, Compound):
-            raise ValueError('Only objects that inherit from Compound '
-                             'can be added to Compounds. You tried to add '
-                             '"{}".'.format(new_child))
         if name:
             self.name = name
 
-        # Create children and labels on the first add operation
-        if self.children is None:
-            self.children = OrderedSet()
+        fl = expand and bool(new_child.children)
+        if adj_names:
+            for x in new_child:  # make all the names in new_child compatible with self
+                if x.name == new_child.name and fl: continue
+                try:
+                    self.root.stm_cnt[(h := x.stml)] += 1
+                    x.name = x.stm + f'{self.stm_cnt[h]}'
+                except KeyError:
+                    x.name = x.stm + '0'
+                    self.root.stm_cnt[h] = 0
 
-        if expand and new_child.children:
-            # if new_child.parent is not None:
-            #     raise MBuildError('Part {} already has a parent: {}'.format(
-            #         new_child, new_child.parent))
+        if fl:
             for x in new_child.children:
-                x.parent = self
+                if cparent:
+                    x.parent = self
+                # if (h:=x.stm.lower()) in self.stm_cnt:
+                #     x.name = x.stm + f'{self.stm_cnt[h] + 1}'
+                #     self.stm_cnt[h] += 1
+                # else:
+                #     x.name = x.stm + '0'
+                #     self.stm_cnt[h] = 0
             self.children |= new_child.children
         else:
             self.children.add(new_child)
-            new_child.parent = self
+            if cparent:
+                new_child.parent = self
 
         if self.root.bond_graph is None:
             self.root.bond_graph = new_child.bond_graph
@@ -535,25 +708,77 @@ class Compound(object):
 
         Parameters
         ----------
-        objs_to_remove : mb.Compound or list of mb.Compound
+        objs_to_remove : mb.Compound or list of mb.Compound or list of strings
             The Compound(s) to be removed from self
 
         """
-        # Preprocessing and validating input type
-        if not hasattr(objs_to_remove, '__iter__'):
-            if objs_to_remove not in self:
-                return
-            objs_to_remove = [objs_to_remove]
-        objs_to_remove = set(objs_to_remove)
+        if not isinstance(objs_to_remove, Compound):
+            for x in objs_to_remove:
+                self.remove(self[x] if isinstance(x, str) else x)
 
-        for obj in objs_to_remove:
-            if obj.root.bond_graph: #take care of removing bonds
-                for p in obj.particles(0):
-                    if obj.root.bond_graph.has_node(p):
-                        obj.root.bond_graph.remove_node(p)
-            obj.parent.children.remove(obj)
-            if not obj.parent.children and obj.parent.parent: #all of its children are removed. Remove itself
-                obj.parent.parent.children.remove(obj.parent)
+        if objs_to_remove not in self:
+            return
+
+        # Preprocessing and validating input type
+        # if not hasattr(objs_to_remove, '__iter__'):
+        #     if objs_to_remove not in self:
+        #         return
+        #     objs_to_remove = [objs_to_remove]
+        # objs_to_remove = set(objs_to_remove)
+
+        obj = objs_to_remove
+        # for obj in objs_to_remove:
+        if obj.root.bond_graph:  # take care of removing bonds
+            for p in obj.particles(0):
+                if obj.root.bond_graph.has_node(p):
+                    obj.root.bond_graph.remove_node(p)
+                    qlist = [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
+                    lst = [x for x in qlist if p in x]
+                    for x in lst:
+                        if len(x) == 2:
+                            f = self.bonds_typed
+                        if len(x) == 3:
+                            f = self.angles_typed
+                        if len(x) == 4:
+                            f = self.propers_typed
+                        f.pop(x)
+
+        obj.parent.children.remove(obj)
+        if not obj.parent.children and obj.parent.parent:  # all of its children are removed. Remove itself
+            obj.parent.parent.children.remove(obj.parent)
+        d = {}
+        for x in self.root:
+            try:
+                if (i := int(re.search('\d+', x.name).group())) > d[x.stml]:
+                    d[x.stml] = i
+            except KeyError:
+                d[x.stml] = 0
+
+        self.root.stm_cnt = d
+
+    def sel(self, pat, lst=1):
+        '''pat: single str or list of patterns
+        lst: return a list of the matched objects
+        you can give for example z<5'''
+        comps = []
+        if isinstance(pat, str):
+            if bool(re.search('<|>', pat)):
+                for lbl in zip('xyz', range(3)):
+                    exp = re.sub(lbl[0], f'self.xyz_with_ports[:, {lbl[1]}]', pat)
+                comps = compress(self.particles(1), eval('np.logical_and('+exp.replace('and', ',')+')'))
+            else:
+                comps = [x for x in self if bool(t := re.search('^' + pat + '$', x.name, re.IGNORECASE))]
+        else:
+            for x in pat:
+                comps.extend(self.sel(x, lst=1))
+        if lst:
+            return comps
+        else:
+            t = Compound(name='sel')
+            for x in comps:
+                # x.parent = [x.parent, t]
+                t.add(x, expand=0, adj_names=0, cparent=0)
+            return t
 
     def add_bond(self, bonds):
         """Add a bond between two Particles.
@@ -566,13 +791,13 @@ class Compound(object):
         """
         if self.root.bond_graph is None:
             self.root.bond_graph = nx.Graph()
-        
-        if isinstance(bonds[0], Iterable):
+
+        if not isinstance(bonds[0], Compound):
             for x in bonds:
                 self.add_bond(x)
             return
 
-        self.root.bond_graph.add_edge(bonds[0], bonds[1])
+        self.root.bond_graph.add_edge(*bonds)
 
     def generate_bonds(self, atoms_a, atoms_b, dmin, dmax):
         """Add Bonds between all pairs of types a/b within [dmin, dmax].
@@ -588,11 +813,22 @@ class Compound(object):
         atoms_a, atoms_b = map(list, [atoms_a, atoms_b])
         neighbs, dists = self.neighbs(atoms_a, atoms_b, rcut=dmax)
 
+        lst = []
+        for i, (x, y) in enumerate(zip(atoms_a, neighbs)):
+            for j, z in enumerate(product(x, y)):
+                t = Counter(z)
+                if t in lst:
+                    neighbs[i].remove(neighbs[i][j])
+                    continue
+                lst.append(t)
+
+        cnt = 0
         for i, p in enumerate(atoms_a):
             for x, d in zip(neighbs[i], dists[i]):
                 if d > dmin:
                     self.add_bond([p, x])
-
+                    cnt += 1
+        print(f'{cnt} bonds added')
 
     def remove_bond(self, particle_pair):
         """Deletes a bond between a pair of Particles
@@ -629,7 +865,7 @@ class Compound(object):
             self._pos = value
         else:
             raise Exception('Cannot set position on a Compound that has'
-                              ' children.')
+                            ' children.')
 
     @property
     def xyz(self):
@@ -649,8 +885,8 @@ class Compound(object):
         return pos
 
     def particles_label_sorted(self, ports=0):
-        atom_names = OrderedSet([atom.name for atom in self.particles(ports)])
-        return [x for label in atom_names for x in self.particles(ports) if x.name == label]
+        atom_names = sorted(OrderedSet([atom.elem for atom in self.particles(ports)]))
+        return [x for label in atom_names for x in self.particles(ports) if x.elem == label]
 
     @property
     def xyz_label_sorted(self):
@@ -703,7 +939,7 @@ class Compound(object):
         for atom, coords in zip(self.particles(1), arrnx3):
             atom.pos = coords
 
-    def center(self,include_ports=0):
+    def center(self, include_ports=0):
         """The cartesian center of the Compound based on its Particles.
 
         Returns
@@ -713,32 +949,33 @@ class Compound(object):
 
         """
 
-        if np.all(np.isfinite(self.xyz )):
+        if np.all(np.isfinite(self.xyz)):
             if include_ports == 1:
                 return np.mean(self.xyz_with_ports, axis=0)
             else:
                 return np.mean(self.xyz, axis=0)
 
-    def lmps_minimize(self, path = None, fixed_atoms=None, movie_freq=100, buff=0):
+    def lmps_minimize(self, path=None, fixed_atoms=None, movie_freq=100, buff=0):
         fixed_atoms = list(fixed_atoms) if fixed_atoms else None
-        self.write_lammpsdata(path if path else 'data.dat',buff=buff)
+        self.write_lammpsdata(path if path else 'data.dat', buff=buff)
         from lammps import lammps
         lmps = lammps()
         lmps.file('runfile')
         # lmps,_ = get_lmps(np.array([self.xyz_label_sorted]))
         commands = []
         if fixed_atoms:
-            commands.append('group fixed id '+' '.join([str(self.particles_label_sorted().index(x)+1) for x in fixed_atoms]))
+            commands.append(
+                'group fixed id ' + ' '.join([str(self.particles_label_sorted().index(x) + 1) for x in fixed_atoms]))
             commands.append('fix fx fixed setforce 0 0 0 ')
         commands.extend([f'dump 10 all custom {movie_freq} movie.lammpstrj element x y z',
-                            'dump_modify 10 element ' +' '.join([x['name'] for x in self.ff.atom_types])+' sort id',
-                            'minimize 1e-8 1e-8 10000 100000'])
+                         'dump_modify 10 element ' + ' '.join([x['name'] for x in self.ff.atom_types]) + ' sort id',
+                         'minimize 1e-8 1e-8 10000 100000'])
         lmps.commands_list(commands)
         os.remove('log.lammps')
-        return np.array(lmps.gather_atoms('x', 1,3)).reshape([-1, 3])#np.ctypeslib.as_array(lmps.extract_atom("x", 3).contents, shape=self.xyz.shape)
+        return np.array(lmps.gather_atoms('x', 1, 3)).reshape(
+            [-1, 3])  # np.ctypeslib.as_array(lmps.extract_atom("x", 3).contents, shape=self.xyz.shape)
 
-
-    def vmd(self,ports=1,atoms=None,label_sorted=1, mol2=0, types=0, commands='pbc box\n '):
+    def vmd(self, atoms=None, ports=1, label_sorted=1, mol2=0, types=0, commands='pbc box\n '):
         """ see the system in vmd """
         nme = 'out.mol2' if mol2 else 'out.lammpstrj'
         f = open('txt', 'w')
@@ -748,23 +985,27 @@ class Compound(object):
                 atoms = [atoms]
             else:
                 atoms = list(atoms)
-            idx = np.in1d(self.particles() if mol2 else self.particles_label_sorted(),atoms)
+            idx = np.in1d(self.particles(ports) if mol2 else self.particles_label_sorted(ports), atoms)
             f.write('mol addrep 0\n'
                     'mol modstyle 1 0 VDW 0.3 30.\n'
-                    'mol modselect 1 0 index '+(np.sum(idx)*'{} ').format(*np.nonzero(idx)[0])+'\n')
-        
-        f.write(f'pbc set {{{self.box.a} {self.box.b} {self.box.c} {self.box.alph} {self.box.bet} {self.box.gam}}} -all\n')
+                    'mol modselect 1 0 index ' + (np.sum(idx) * '{} ').format(*np.nonzero(idx)[0]) + '\n')
+
+        f.write(
+            f'pbc set {{{self.box.a} {self.box.b} {self.box.c} {self.box.alph} {self.box.bet} {self.box.gam}}} -all\n')
         f.write(commands)
+
+        # f.write('mol showperiodic 0 0 z\n')
+        # f.write('mol numperiodic 0 0 1\n')
         f.close()
         self.save(nme) if mol2 else self.write_lammpstrj()
         os.system(f'/home/ali/software/vmd-1.9.4a43/bin2/vmd {nme} -e txt')
         os.system(f'rm {nme} txt')
 
-    def write_lammpstrj(self, fle='out', unit_set='real',ports=1, label_sorted=1, types=0):
+    def write_lammpstrj(self, fle='out', unit_set='real', ports=1, label_sorted=1, types=0):
         """Write one or more frames of data to a lammpstrj file.
            types: if the forcefield types were assigned
         """
-        fle=open(fle+'.lammpstrj','w')
+        fle = open(fle + '.lammpstrj', 'w')
         fle.write('ITEM: TIMESTEP\n'
                   '0\n'
                   'ITEM: NUMBER OF ATOMS\n'
@@ -780,18 +1021,14 @@ class Compound(object):
             c = part.pos
             fle.write(f"{part.type['name'] if types else part.name} {c[0]} {c[1]} {c[2]}\n")
 
-
-    def write_poscar(self, path='.', lattice_const = 1,
-                     fixed_atoms=[],coord='cartesian'):
+    def write_poscar(self, path='.', lattice_const=1,
+                     fixed_atoms=[], coord='cartesian'):
         """
-        Parameters
-        ----------
-        filename: str
-            Path of the output file
         coord: str, default = 'cartesian', other option = 'direct'
             Coordinate style of atom positions
         """
-        atom_names = OrderedSet([atom.name for atom in self.particles(0)])
+        lst = self.particles_label_sorted(0)
+        atom_names = OrderedSet(elems := [atom.elem for atom in lst])
 
         if coord == 'direct':
             for atom in structure.atoms:
@@ -801,24 +1038,24 @@ class Compound(object):
 
         path.replace('POSCAR', '')
         with open(os.path.join(path, 'POSCAR'), 'w') as data:
-            data.write(f' - created by mBuild\n'
-                                f'{lattice_const}\n')
+            out = f' - created by mBuild\n' f'{lattice_const}\n'
             for x in self.latmat:
-                data.write(f'{x[0]} {x[1]} {x[2]} \n')
-            data.write((len(atom_names)*'{} ').format(*atom_names)+'\n')
-            part_names = [x.name for x in self.particles(0)]
-            data.write((len(atom_names)*'{} ').format(*[part_names.count(y) for y in atom_names])+'\n')
+                out += f'{x[0]} {x[1]} {x[2]} \n'
+            out += (len(atom_names) * '{} ').format(*atom_names) + '\n'
+            out += (len(atom_names) * '{} ').format(*[elems.count(y) for y in atom_names]) + '\n'
 
             if fixed_atoms:
-                data.write('Selective Dyn\n')
-            data.write(coord+'\n')
+                out += 'Selective Dyn\n'
+            out += coord + '\n'
 
-            for p in self.particles_label_sorted():
-                data.write('{0:.13f} {1:.13f} {2:.13f} '.format(*p.pos))
+            for p in lst:
+                out += '{0:.13f} {1:.13f} {2:.13f} '.format(*p.pos)
                 if fixed_atoms:
-                    data.write(' '.join(3*['F' if p in fixed_atoms else 'T'])+'\n')
+                    out += ' '.join(3 * ['F' if p in fixed_atoms else 'T']) + '\n'
                 else:
-                    data.write('\n')
+                    out += '\n'
+            data.write(out)
+        return out
 
     def particles_in_range(
             self,
@@ -878,11 +1115,13 @@ class Compound(object):
         return c1, c2, c3
 
     def closest_img_dihed(self, p1, p2, p3, p4):
-        ''' input three particles, get back three coordinates '''
+        ''' input four particles, get back four coordinates '''
         c1, c2, c3 = self.closest_img_angle(p1, p2, p3)
         c4 = self.neighbs(c3, p4, closest_img=1)[0]
         return c1, c2, c3, c4
 
+    def atom_at_pos(self, coord):
+        return [x for x in self.particles() if np.allclose(x.pos, coord)]
 
     def closest_img(self, atom, atoms):
         ''' among atoms and their images, who is closest to atom'''
@@ -895,13 +1134,13 @@ class Compound(object):
 
         r = (atom.pos - coords_set2) @ inv(self.latmat)
         rfrac = r - np.round(r)
-        dists = norm(rfrac @ self.latmat,axis=1)
+        dists = norm(rfrac @ self.latmat, axis=1)
 
         return atoms[np.argmin(dists)]
 
-    def neighbs(self,set1,set2=None,rcut=2,slf=0, closest_img=0):
+    def neighbs(self, set1, set2=None, rcut=2, slf=0, closest_img=0):
         ''' set1: either a list of atoms or a list of coordinates'''
-        if isinstance(set1, Iterable):  #this way to be able to handle generators coming for set1
+        if isinstance(set1, Iterable):  # this way to be able to handle generators coming for set1
             set1 = list(set1)
             if not isinstance(set1[0], Compound):
                 set1 = [set1]
@@ -917,18 +1156,19 @@ class Compound(object):
             set2 = self.particles()
 
         coords_set1 = np.vstack([x.xyz for x in set1]) if isinstance(set1[0], Compound) else set1
-        coords_set2 = np.vstack([x.xyz for x in set2]) if set2 else self.xyz  #self.xyz[[x in set2 for x in self.particles()]]
+        coords_set2 = np.vstack(
+            [x.xyz for x in set2]) if set2 else self.xyz  # self.xyz[[x in set2 for x in self.particles()]]
 
         idx = [[] for i in range(set1.__len__())]
         odists = deepcopy(idx)
-        for cnt,coord in enumerate(coords_set1):
+        for cnt, coord in enumerate(coords_set1):
             r = (coord - coords_set2) @ inv(self.latmat)
             rfrac = r - np.round(r)
-            dists = norm(rfrac @ self.latmat,axis=1)
+            dists = norm(rfrac @ self.latmat, axis=1)
             if closest_img:
                 return coord - rfrac @ self.latmat
 
-            tmp = dists<rcut
+            tmp = dists < rcut
             for x, y in zip(compress(set2, tmp), compress(dists, tmp)):
                 if slf or set1[cnt] != x:
                     idx[cnt].append(x)
@@ -936,7 +1176,39 @@ class Compound(object):
             # [x for x in  if slf or set1[cnt]!=x])
             # odists.extend([dists[i] for i, x in enumerate(compress(set2, tmp)) ])
 
-        return idx,odists
+        return idx, odists
+
+    def neighbs_nonp(self, set1, set2=None, rcut=2, slf=0):
+        ''' like neighbs but nonperiodic'''
+        if isinstance(set1, Iterable):  # this way to be able to handle generators coming for set1
+            set1 = list(set1)
+            if not isinstance(set1[0], Compound):
+                set1 = [set1]
+        else:
+            set1 = [set1]
+
+        if set2:
+            if isinstance(set2, Iterable):
+                set2 = list(set2)
+            else:
+                set2 = [set2]
+        else:
+            set2 = self.particles()
+
+        coords_set1 = np.vstack([x.xyz for x in set1]) if isinstance(set1[0], Compound) else set1
+        coords_set2 = np.vstack(
+            [x.xyz for x in set2]) if set2 else self.xyz  # self.xyz[[x in set2 for x in self.particles()]]
+
+        idx = [[] for i in range(set1.__len__())]
+        odists = deepcopy(idx)
+        for cnt, coord in enumerate(coords_set1):
+            dists = norm(coord - coords_set2, axis=1)
+            tmp = dists < rcut
+            for x, y in zip(compress(set2, tmp), compress(dists, tmp)):
+                if slf or set1[cnt] != x:
+                    idx[cnt].append(x)
+                    odists[cnt].append(y)
+        return idx, odists
 
     def _update_port_locations(self, initial_coordinates):
         """Adjust port locations after particles have moved
@@ -969,7 +1241,7 @@ class Compound(object):
         """
         xyz_init = self.xyz
         for particle in self.particles(0):
-            particle.pos += (np.random.rand(3,) - 0.5) / 100
+            particle.pos += (np.random.rand(3, ) - 0.5) / 100
         self._update_port_locations(xyz_init)
 
     def energy_minimize(self, forcefield='UFF', steps=1000, **kwargs):
@@ -1194,7 +1466,7 @@ class Compound(object):
         from simtk.openmm.openmm import LangevinIntegrator
         import simtk.unit as u
 
-        system = to_parmed.createSystem() # Create an OpenMM System
+        system = to_parmed.createSystem()  # Create an OpenMM System
         # Create a Langenvin Integrator in OpenMM
         integrator = LangevinIntegrator(298 * u.kelvin, 1 / u.picosecond,
                                         0.002 * u.picoseconds)
@@ -1346,8 +1618,8 @@ class Compound(object):
                 get_by_symbol(particle.name)
             except KeyError:
                 raise Exception("Element name {} not recognized. Cannot "
-                                  "perform minimization."
-                                  "".format(particle.name))
+                                "perform minimization."
+                                "".format(particle.name))
 
         obConversion = openbabel.OBConversion()
         obConversion.SetInAndOutFormats("mol2", "pdb")
@@ -1358,9 +1630,9 @@ class Compound(object):
         ff = openbabel.OBForceField.FindForceField(forcefield)
         if ff is None:
             raise Exception("Force field '{}' not supported for energy "
-                              "minimization. Valid force fields are 'MMFF94', "
-                              "'MMFF94s', 'UFF', 'GAFF', and 'Ghemical'."
-                              "".format(forcefield))
+                            "minimization. Valid force fields are 'MMFF94', "
+                            "'MMFF94s', 'UFF', 'GAFF', and 'Ghemical'."
+                            "".format(forcefield))
         # warn(
         #     "Performing energy minimization using the Open Babel package. Please "
         #     "refer to the documentation to find the appropriate citations for "
@@ -1374,7 +1646,7 @@ class Compound(object):
             ff.ConjugateGradients(steps)
         else:
             raise Exception("Invalid minimization algorithm. Valid options "
-                              "are 'steep', 'cg', and 'md'.")
+                            "are 'steep', 'cg', and 'md'.")
         ff.UpdateCoordinates(mol)
 
         obConversion.WriteFile(mol, os.path.join(tmp_dir, 'minimized.pdb'))
@@ -1491,7 +1763,7 @@ class Compound(object):
         if forcefield_name or forcefield_files:
             foyer = import_('foyer')
             ff = foyer.Forcefield(forcefield_files=forcefield_files,
-                            name=forcefield_name, debug=forcefield_debug)
+                                  name=forcefield_name, debug=forcefield_debug)
             if not foyer_kwargs:
                 foyer_kwargs = {}
             structure = ff.apply(structure, **foyer_kwargs)
@@ -1505,7 +1777,7 @@ class Compound(object):
         if saver:  # mbuild supported saver.
             if extension in ['.gsd', '.hoomdxml']:
                 kwargs['rigid_bodies'] = [
-                        p.rigid_id for p in self.particles()]
+                    p.rigid_id for p in self.particles()]
             saver(filename=filename, structure=structure)
 
         elif extension == '.sdf':
@@ -1517,7 +1789,7 @@ class Compound(object):
             pybel_molecule = new_compound.to_pybel()
             # Write out pybel molecule to SDF file
             output_sdf = pybel.Outputfile("sdf", filename,
-                    overwrite=overwrite)
+                                          overwrite=overwrite)
             output_sdf.write(pybel_molecule)
             output_sdf.close()
 
@@ -1556,11 +1828,13 @@ class Compound(object):
         import numpy.random as rnd
         vels = rnd.normal(size=[self.n_particles(), 3])
         for i, x in enumerate(self.particles_label_sorted()):
-            tmp = (u.BOLTZMANN_CONSTANT_kB*temp*u.kelvin/float(x.type['mass'])/u.gram*u.AVOGADRO_CONSTANT_NA._value).\
-                      in_units_of(u.angstrom**2/u.femtoseconds**2)
+            tmp = (u.BOLTZMANN_CONSTANT_kB * temp * u.kelvin / float(
+                x.type['mass']) / u.gram * u.AVOGADRO_CONSTANT_NA._value). \
+                in_units_of(u.angstrom ** 2 / u.femtoseconds ** 2)
             vels[i] *= np.sqrt(tmp._value)
 
-    def supercell(self,p):
+    def supercell(self, p, adj_names=1):
+        '''adj_names: adjust names so that they are unique afterwards'''
         p = np.array(p)
         if np.array(p).flatten().size == 3:
             p = np.diag(p)
@@ -1573,12 +1847,12 @@ class Compound(object):
                             [1, 0, 0], [1, 0, 1],
                             [1, 1, 0], [1, 1, 1]]) @ p;
 
-        mn = np.amin(corners,0)
-        mx = np.amax(corners,0)
-        aa, bb, cc = np.meshgrid(*[np.arange(x,y+1) for x,y in zip(mn,mx)])
-        fracs = np.vstack([x.flatten(order='F') for x in [aa,bb,cc]]).transpose() @ inv(p)
+        mn = np.amin(corners, 0)
+        mx = np.amax(corners, 0)
+        aa, bb, cc = np.meshgrid(*[np.arange(x, y + 1) for x, y in zip(mn, mx)])
+        fracs = np.vstack([x.flatten(order='F') for x in [aa, bb, cc]]).transpose() @ inv(p)
 
-        eps=1e-8
+        eps = 1e-8
         tmp1 = deepcopy(self)
         self.remove(self.particles(1))
         flg = 1
@@ -1590,7 +1864,8 @@ class Compound(object):
                     first_cell = tmp
                     flg = 0
                 tmp.xyz += val
-                self.add(tmp)
+                self.add(tmp, adj_names=1)
+
         nlst1 = tmp1.particles()
         nlst2 = self.particles()
         n1 = tmp1.n_particles()
@@ -1605,8 +1880,6 @@ class Compound(object):
             self.gen_angs_and_diheds()
 
         self.wrap_atoms()
-
-
 
     @property
     def index(self):
@@ -1691,7 +1964,8 @@ class Compound(object):
 
         return md.Trajectory(self.xyz, top, \
                              unitcell_lengths=[np.linalg.norm(x) for x in self.latmat],
-                             unitcell_angles=[angle_between_vecs(v1,v2) for v1,v2 in combinations(self.latmat,2)][::-1])
+                             unitcell_angles=[angle_between_vecs(v1, v2) for v1, v2 in combinations(self.latmat, 2)][
+                                             ::-1])
 
     def _to_topology(self, atom_list, chains=None, residues=None):
         """Create a mdtraj.Topology from a Compound.
@@ -1814,7 +2088,7 @@ class Compound(object):
         return top
 
     def from_parmed(self, structure, coords_only=False,
-            infer_hierarchy=True):
+                    infer_hierarchy=True):
         """Extract atoms and bonds from a pmd.Structure.
 
         Will create sub-compounds for every chain if there is more than one
@@ -1876,11 +2150,9 @@ class Compound(object):
             atom2 = atom_mapping[bond.atom2]
             self.add_bond((atom1, atom2))
 
-        self.latmat=np.array(structure.box_vectors._value)
+        self.latmat = np.array(structure.box_vectors._value)
 
     # def from_ase(self, atoms_obj):
-        
-
 
     @property
     def frac_coords(self):
@@ -1892,23 +2164,17 @@ class Compound(object):
         Parameters
         ----------
         returns: pymatgen.Structure"""
-        trj = self.to_trajectory()
-        return Structure(Lattice.from_parameters(*trj.unitcell_lengths,*trj.unitcell_angles),\
-                         [x.name for x in self.particles()],self.xyz)
+        from pymatgen.core import Structure, Lattice
+        return Structure(
+            Lattice.from_parameters(self.box.a, self.box.b, self.box.c, self.box.alph, self.box.bet, self.box.gam), \
+            [x.name for x in self.particles()], self.xyz, coords_are_cartesian=1)
 
-
-    def to_parmed(self, box=None, title='', residues=None, show_ports=False,
-            infer_residues=False):
+    def to_parmed(self, title='', residues=None, show_ports=False,
+                  infer_residues=False):
         """Create a ParmEd Structure from a Compound.
 
         Parameters
         ----------
-        box : mb.Box, optional, default=self.boundingbox (with buffer)
-            Box information to be used when converting to a `Structure`.
-            If 'None', a bounding box is used with 0.25nm buffers at
-            each face to avoid overlapping atoms, unless `self.periodicity`
-            is not None, in which case those values are used for the
-            box lengths.
         title : str, optional, default=self.name
             Title/name of the ParmEd Structure
         residues : str of list of str
@@ -1984,24 +2250,8 @@ class Compound(object):
                 if current_residue not in structure.residues:
                     structure.residues.append(current_residue)
 
-                atomic_number = None
-                name = ''.join(char for char in atom.name if not char.isdigit())
-                try:
-                    atomic_number = AtomicNum[atom.name.capitalize()]
-                except KeyError:
-                    element = element_by_name(atom.name.capitalize())
-                    if name not in guessed_elements:
-                        # warn(
-                        #     'Guessing that "{}" is element: "{}"'.format(
-                        #         atom, element))
-                        guessed_elements.add(name)
-                else:
-                    element = atom.name.capitalize()
-
-                atomic_number = atomic_number or AtomicNum[element]
-                mass = Mass[element]
-                pmd_atom = pmd.Atom(atomic_number=atomic_number, name=atom.name,
-                                    mass=mass)
+                pmd_atom = pmd.Atom(atomic_number=AtomicNum[atom.elem], name=atom.elem,
+                                    mass=Mass[atom.elem])
                 pmd_atom.xx, pmd_atom.xy, pmd_atom.xz = atom.pos  # Angstroms
 
             residue = atom_residue_map[atom]
@@ -2018,8 +2268,8 @@ class Compound(object):
             bond = pmd.Bond(atom_mapping[atom1], atom_mapping[atom2])
             structure.bonds.append(bond)
 
-        bb = self.to_trajectory()
-        structure.box = bb.unitcell_lengths[0].tolist()+bb.unitcell_angles[0].tolist()
+        b = self.box
+        structure.box = [b.a, b.b, b.c, b.alph, b.bet, b.gam]
         return structure
 
     def to_networkx(self, names_only=False):
@@ -2114,22 +2364,21 @@ class Compound(object):
                 temp.SetAtomicNum(AtomicNum[part.name.capitalize()])
             except KeyError:
                 warn("Could not infer atomic number from "
-                        "{}, setting to 0".format(part.name))
+                     "{}, setting to 0".format(part.name))
                 temp.SetAtomicNum(0)
-
 
             temp.SetVector(*(part.pos))
             particle_to_atom_index[part] = i
 
         ucell = openbabel.OBUnitCell()
-        ucell.SetData(*map(lambda x:openbabel.vector3(*x),np.array(self.latmat, dtype=float)))
+        ucell.SetData(*map(lambda x: openbabel.vector3(*x), np.array(self.latmat, dtype=float)))
 
         if self.bond_graph:
             for bond in self.bond_graph.edges:
                 bond_order = 1
-                mol.AddBond(particle_to_atom_index[bond[0]]+1,
-                        particle_to_atom_index[bond[1]]+1,
-                        bond_order)
+                mol.AddBond(particle_to_atom_index[bond[0]] + 1,
+                            particle_to_atom_index[bond[1]] + 1,
+                            bond_order)
 
         return pybel.Molecule(mol)
 
@@ -2152,14 +2401,14 @@ class Compound(object):
         # but this seemed more convenient at time of writing
         # pybel atoms are 1-indexed, coordinates in Angstrom
         for atom in pybel_mol.atoms:
-            xyz = np.array(atom.coords)/10
+            xyz = np.array(atom.coords) / 10
             if use_element:
                 try:
                     temp_name = Element[atom.atomicnum]
                 except KeyError:
                     warn("No element detected for atom at index "
-                            "{} with number {}, type {}".format(
-                                atom.idx, atom.atomicnum, atom.type))
+                         "{} with number {}, type {}".format(
+                        atom.idx, atom.atomicnum, atom.type))
                     temp_name = atom.type
             else:
                 temp_name = atom.type
@@ -2180,24 +2429,25 @@ class Compound(object):
         # so we need to look into the OBMol object,
         # using an iterator from the openbabel library
         for bond in openbabel.OBMolBondIter(pybel_mol.OBMol):
-            self.add_bond([self[bond.GetBeginAtomIdx()-1],
-                            self[bond.GetEndAtomIdx()-1]])
+            self.add_bond([self[bond.GetBeginAtomIdx() - 1],
+                           self[bond.GetEndAtomIdx() - 1]])
 
         if hasattr(pybel_mol, 'unitcell'):
-            box = Box(lengths=[pybel_mol.unitcell.GetA()/10,
-                                pybel_mol.unitcell.GetB()/10,
-                                pybel_mol.unitcell.GetC()/10],
-                        angles=[pybel_mol.unitcell.GetAlpha(),
-                                pybel_mol.unitcell.GetBeta(),
-                                pybel_mol.unitcell.GetGamma()])
+            box = Box(lengths=[pybel_mol.unitcell.GetA() / 10,
+                               pybel_mol.unitcell.GetB() / 10,
+                               pybel_mol.unitcell.GetC() / 10],
+                      angles=[pybel_mol.unitcell.GetAlpha(),
+                              pybel_mol.unitcell.GetBeta(),
+                              pybel_mol.unitcell.GetGamma()])
             self.periodicity = box.lengths
         else:
             warn("No unitcell detected for pybel.Molecule {}".format(pybel_mol))
-#       TODO: Decide how to gather PBC information from openbabel. Options may
-#             include storing it in .periodicity or writing a separate function
-#             that returns the box.
 
-    def to_intermol(self, molecule_types=None): # pragma: no cover
+    #       TODO: Decide how to gather PBC information from openbabel. Options may
+    #             include storing it in .periodicity or writing a separate function
+    #             that returns the box.
+
+    def to_intermol(self, molecule_types=None):  # pragma: no cover
         """Create an InterMol system from a Compound.
 
         Parameters
@@ -2265,7 +2515,6 @@ class Compound(object):
         smiles = pybel_cmp.write().split()[0]
         return smiles
 
-
     @staticmethod
     def _add_intermol_molecule_type(intermol_system, parent):  # pragma: no cover
         """Create a molecule type for the parent and add bonds.
@@ -2286,23 +2535,40 @@ class Compound(object):
             intermol_bond = InterMolBond(atom1.index, atom2.index)
             molecule_type.bonds.add(intermol_bond)
 
+    def all_names(self):
+        return [x.name for x in self]
+
+    def __iter__(self):
+        yield self
+        for x in self.children:
+            if x.children:
+                yield from x
+            else:
+                yield x
+
     def __getitem__(self, selection):
 
         if isinstance(selection, int):
             return self.children[selection]
+        elif isinstance(selection, str):
+            tmp = [x for x in self if bool(re.search('^' + selection + '$',x.name , re.IGNORECASE))]
+            if len(tmp) == 1:
+                return tmp[0]
+            elif not tmp:
+                return []
+            else:
+                warn('you have non-unique names')
+                return tmp
         if isinstance(selection, str):
+            # for x in self.children:
+            #     if selection == x.name:
             if selection not in [x.name for x in self.children]:
-                raise Exception('{}[\'{}\'] does not exist.'.format(self.name,selection))
+                raise Exception('{}[\'{}\'] does not exist.'.format(self.name, selection))
             out = [x for x in self.children if x.name == selection]
-            if out.__len__()==1:
+            if out.__len__() == 1:
                 return out[0]
             else:
                 return out
-        lst = []
-        if isinstance(selection, Iterable):
-            for x in selection:
-                lst.append(self.__getitem__(x))
-            return lst
 
     def __repr__(self):
         descr = list('<')
@@ -2311,79 +2577,18 @@ class Compound(object):
         if self.children:
             descr.append('{:d} particles, '.format(self.n_particles(1)))
         else:
-            descr.append('pos=({: .4f},{: .4f},{: .4f}), '.format(*self.pos))
+            descr.append('pos=[{: .4f},{: .4f},{: .4f}], '.format(*self.pos))
 
         # descr.append('{:d} bonds, '.format(self.n_bonds))
 
         descr.append('id: {}>'.format(str(id(self))[-4:-1]))
         return ''.join(descr)
 
-    def _clone(self, clone_of=None, root_container=None):
-        """A faster alternative to deepcopying.
-
-        Does not resolve circular dependencies. This should be safe provided
-        you never try to add the top of a Compound hierarchy to a
-        sub-Compound. Clones compound hierarchy only, not the bonds.
-        """
-        if root_container is None:
-            root_container = self
-        if clone_of is None:
-            clone_of = dict()
-
-        # If this compound has already been cloned, return that.
-        if self in clone_of:
-            return clone_of[self]
-
-        # Otherwise we make a new clone.
-        cls = self.__class__
-        newone = cls.__new__(cls)
-
-        # Remember that we're cloning the new one of self.
-        clone_of[self] = newone
-
-        newone.name = deepcopy(self.name)
-        # newone.periodicity = deepcopy(self.periodicity)
-        newone._pos = deepcopy(self._pos)
-        newone.port_particle = deepcopy(self.port_particle)
-        if hasattr(self, 'index'):
-            newone.index = deepcopy(self.index)
-
-        if self.children is None:
-            newone.children = None
-        else:
-            newone.children = OrderedSet()
-        # Parent should be None initially.
-        newone.parent = None
-        newone.labels = OrderedDict()
-        newone.referrers = set()
-        newone.bond_graph = None
-
-        # Add children to clone.
-        if self.children:
-            for child in self.children:
-                newchild = child._clone(clone_of, root_container)
-                newone.children.add(newchild)
-                newchild.parent = newone
-
-        return newone
-
-    def _clone_bonds(self, clone_of=None):
-        """While cloning, clone the bond of the source compound to clone compound"""
-        newone = clone_of[self]
-        for c1, c2 in self.bonds():
-            try:
-                newone.add_bond((clone_of[c1], clone_of[c2]))
-            except KeyError:
-                raise Exception(
-                    "Cloning failed. Compound contains bonds to "
-                    "Particles outside of its containment hierarchy.")
-
     def wrap_atoms(self):
         """wraps atoms to equivalent positions inside the unit cell"""
-        self.xyz=(self.frac_coords-np.floor(self.frac_coords)) @ self.latmat
+        self.xyz = (self.frac_coords - np.floor(self.frac_coords)) @ self.latmat
 
-
-    def read_xyz(self,filename):
+    def read_xyz(self, filename):
         """Read an XYZ file. The expected format is as follows:
         The first line contains the number of atoms in the file The second line
         contains a comment, which is not read.  Remaining lines, one for each
@@ -2439,7 +2644,6 @@ class Compound(object):
                 raise Exception(msg.format(n_atoms))
 
         return compound
-
 
     def write_xyz(self, filename, label_sorted=0):
         '''filename can be an already opened file'''
@@ -2509,31 +2713,36 @@ class Compound(object):
         atom_positions = transform.apply_to(atom_positions)
         compound.xyz_with_ports = atom_positions
 
+    def copy_upnums(self):
+        '''copy and update numbering'''
+        cop = deepcopy(self)
+        for x in cop:
+            cop.stm_cnt[(h := x.stml)] += 1
+            x.name = x.stm + f'{cop.stm_cnt[h]}'
+        return cop
 
-    def force_overlap(self,comp_to_mv,port_of_comp,
-                      port_of_target,add_bond=1,flip=0,rotate_ang=0):
+    def force_overlap(self, comp_to_mv, port_of_comp,
+                      port_of_target, add_bond=1, flip=0, rotate_ang=0):
         """
         rotate_ang: in degrees
+        port_of_comp: has to be an element of comp_to_mv
         """
         port_of_comp.orientation /= norm(port_of_comp.orientation)
         port_of_target.orientation /= norm(port_of_target.orientation)
 
-        comp_to_mv.xyz_with_ports -= port_of_comp.pos
-        comp_to_mv.rotate_vecs(port_of_comp.orientation, port_of_target.orientation, pnt=port_of_comp.pos)
+        comp_to_mv.xyz_with_ports += port_of_target.pos - port_of_comp.pos
+        comp_to_mv.rotate_vecs(port_of_comp.orientation, port_of_target.orientation, rotpnt=port_of_comp)
         if flip:
             comp_to_mv.reflect(port_of_comp.pos, port_of_comp.orientation)
 
-        comp_to_mv.rotate_around(port_of_comp.orientation, rotate_ang)
-
-        comp_to_mv.xyz_with_ports += port_of_target.pos
+        comp_to_mv.rotate_around(port_of_comp.orientation, rotate_ang, pnt=port_of_comp.pos)
 
         if port_of_comp.anchor and port_of_target.anchor:
             self.add_bond([port_of_comp.anchor, port_of_target.anchor])
         port_of_comp.parent.remove(port_of_comp)
         port_of_target.parent.remove(port_of_target)
 
-
-    def _create_equivalence_transform(self,equiv):
+    def _create_equivalence_transform(self, equiv):
         """Compute an equivalence transformation that transforms this compound
         to another compound's coordinate system.
 
@@ -2575,7 +2784,6 @@ class Compound(object):
         T = RigidTransform(self_points, other_points)
         return T
 
-
     def bond_partners(self):
 
         out = set()
@@ -2585,7 +2793,6 @@ class Compound(object):
             elif b[1] is self:
                 out.add(b[0])
         return out
-
 
     def _node_match(self, host, pattern):
         """ Determine if two graph nodes are equal """
@@ -2646,49 +2853,57 @@ class Compound(object):
             raise NotImplementedError('matches_string is not yet implemented')
 
     def network_b_a_d(self):
-         # create angles and dihedrals
-        nlst = list(self.particles(0))
+        # create angles and dihedrals
+        nlst = list(self.bond_graph.nodes())
         angles = OrderedSet()
         propers = OrderedSet()
         for i, part1 in enumerate(nlst):
-            for part2 in nlst[i+1:]:
-                tmp = nx.all_simple_paths(self.bond_graph, part1, part2, 4) # type: list
+            for part2 in nlst[i + 1:]:
+                tmp = nx.all_simple_paths(self.bond_graph, part1, part2, 4)  # type: list
                 for ipath in list(tmp):
                     if len(ipath) == 3:
                         angles.add(tuple([x for x in ipath]))
                     elif len(ipath) == 4:
                         propers.add(tuple([x for x in ipath]))
         return self.bond_graph.edges, angles, propers
-    
-    def create_bonding_all(self, kb=300, ka=500, kd=500, acfpath=None):
+
+    def create_bonding_all(self, kb=300, ka=500, kd=500):
         import pymatgen.core.periodic_table as pt
         # ff = ElementTree(element=Element('ForceField'))
-        types = equivalence_classes(self.particles_label_sorted(), lambda x,y: x.name==y.name)
+        types, _ = equivalence_classes(self.particles_label_sorted(), lambda x, y: x.name == y.name)
         # atom_type = SubElement(ff.getroot(), 'AtomTypes')
-        self.ff = FF()
+        # for x in types:
+        #     mass = pt.Element(x[0].elem).atomic_mass
+        #     for i, atom in enumerate(x, 1):
+        #         nme = atom.name + str(i)
+        #         atom.type = {'name': nme, 'mass': str(mass.real), 'element': atom.name}
+        #         self.ff.atom_types.append(atom.type)
         # aa = [[ 89.  , 227.03], [ 47.  , 107.87], [ 13.  ,  26.98], [ 95.  , 243.  ], [ 18.  ,  39.95], [ 33.  ,  74.92], [ 85.  , 210.  ], [ 79.  , 196.97], [  5.  ,  10.81], [ 56.  , 137.33], [  4.  ,   9.01], [ 83.  , 208.98], [ 97.  , 247.  ], [ 35.  ,  79.9 ], [  6.  ,  12.01], [ 20.  ,  40.08], [ 48.  , 112.41], [ 58.  , 140.12], [ 98.  , 251.  ], [ 17.  ,  35.45], [ 96.  , 247.  ], [ 27.  ,  58.93], [ 24.  ,  52.  ], [ 55.  , 132.91], [ 29.  ,  63.55], [ 66.  , 162.5 ], [ 68.  , 167.26], [ 99.  , 252.  ], [ 63.  , 151.97], [  9.  ,  19.  ], [ 26.  ,  55.85], [100.  , 257.  ], [ 87.  , 223.  ], [ 31.  ,  69.72], [ 64.  , 157.25], [ 32.  ,  72.61], [  1.  ,   1.01], [105.  , 260.  ], [  2.  ,   4.  ], [ 72.  , 178.49], [ 80.  , 200.59], [ 67.  , 164.93], [ 53.  , 126.91], [ 49.  , 114.82], [ 77.  , 192.22], [ 19.  ,  39.1 ], [ 36.  ,  83.8 ], [ 57.  , 138.91], [  3.  ,   6.94], [103.  , 260.  ], [ 71.  , 174.97], [101.  , 258.  ], [ 12.  ,  24.31], [ 25.  ,  54.94], [ 42.  ,  95.94], [  7.  ,  14.01], [ 11.  ,  22.99], [ 41.  ,  92.91], [ 60.  , 144.24], [ 10.  ,  20.18], [ 28.  ,  58.69], [102.  , 259.  ], [ 93.  , 237.05], [  8.  ,  16.  ], [ 76.  , 190.2 ], [ 15.  ,  30.97], [ 91.  , 231.04], [ 82.  , 207.2 ], [ 46.  , 106.42], [ 61.  , 145.  ], [ 84.  , 209.  ], [ 59.  , 140.91], [ 78.  , 195.08], [ 94.  , 244.  ], [ 88.  , 226.03], [ 37.  ,  85.47], [ 75.  , 186.21], [104.  , 261.  ], [ 45.  , 102.91], [ 86.  , 222.  ], [ 44.  , 101.07], [ 16.  ,  32.07], [ 51.  , 121.75], [ 21.  ,  44.96], [ 34.  ,  78.96], [ 14.  ,  28.09], [ 62.  , 150.36], [ 50.  , 118.71], [ 38.  ,  87.62], [ 73.  , 180.95], [ 65.  , 158.93], [ 43.  ,  98.  ], [ 52.  , 127.6 ], [ 90.  , 232.04], [ 22.  ,  47.88], [ 81.  , 204.38], [ 69.  , 168.93], [ 92.  , 238.03], [ 23.  ,  50.94], [ 74.  , 183.85], [ 54.  , 131.29], [ 39.  ,  88.91], [ 70.  , 173.04], [ 30.  ,  65.39], [ 40.  ,  91.22], [106.  ,   2.01]]
         # aa = {x[0]:x[1] for x in aa}
+        """ this parts reads bader charges
+        if acfpath:
+            chg = check_output(''' awk 'BEGIN{flg=0};/--/{getline;flg=!flg}flg{print $5}' '''+os.path.join(acfpath,'ACF.dat'), shell=1)
+            chg = np.genfromtxt(io.BytesIO(chg))
+            elemchg = {'Ca': 8, 'H': 1, 'O': 6, 'Si': 4, 'C': 4}  # Ca, H, O, Si, C
 
-        chg = check_output(''' awk 'BEGIN{flg=0};/--/{getline;flg=!flg}flg{print $5}' '''+os.path.join(acfpath,'ACF.dat'), shell=1)
-        chg = np.genfromtxt(io.BytesIO(chg))
-        elemchg = {'Ca': 8, 'H': 1, 'O': 6, 'Si': 4, 'C': 4}  # Ca, H, O, Si, C
-
-        for x in types:
-            mass = pt.Element(x[0].name).atomic_mass
-            for i, atom in enumerate(x, 1):
-                nme = atom.name+str(i)
-                atom.type = {'name':nme, 'mass':str(mass.real), 'element':atom.name, 'charge':str(elemchg[atom.name] - chg[i])}
-                self.ff.atom_types.append(atom.type)
-
-        self.bonds_typed = OrderedDict()
-        self.angles_typed = OrderedDict()
-        self.propers_typed = OrderedDict()
+        if acfpath:
+            for i, atom in enumerate(self.particles_label_sorted()):
+                atom.type['charge'] = str(elemchg[atom.name] - chg[i])
+        """
+        # if acfpath:
+        #     with open(os.path.join(acfpath, 'DDEC6_even_tempered_net_atomic_charges.xyz'), 'r') as f:
+        #         charges = np.zeros(self.n_particles())
+        #         lines = f.readlines()
+        #         for i, atom in enumerate(self.particles_label_sorted()):
+        #             atom.charge = lines[2 + i].split()[-1]
 
         bonds, angles, propers = self.network_b_a_d()
         for x in bonds:
             # if cnt==1:
             mag = bond_length(self.closest_img_bond(*x), 0)
-            self.ff.bond_types.append({'k':str(kb), 'length':str(mag[0]), 'type1':x[0].type['name'], 'type2':x[1].type['name']})
+            self.ff.bond_types.append(defaultdict(lambda: '',
+                                                  {'k': str(kb), 'rest': str(mag[0]), 'type1': x[0].type,
+                                                   'type2': x[1].type}))
             self.bonds_typed[x] = self.ff.bond_types[-1]
             # cnt += 1
 
@@ -2696,7 +2911,9 @@ class Compound(object):
             mag = bend_angle(self.closest_img_angle(*x), 0)
             if np.isclose(mag, np.pi, atol=.001, rtol=0) or np.isclose(mag, 0, atol=.001):
                 continue
-            self.ff.angle_types.append({'k':str(ka), 'angle':str(math.degrees(mag[0])), 'type1':x[0].type['name'], 'type2':x[1].type['name'], 'type3':x[2].type['name']})
+            self.ff.angle_types.append(defaultdict(lambda: '', {'k': str(ka), 'rest': str(math.degrees(mag[0])),
+                                                                'type1': x[0].type, 'type2': x[1].type,
+                                                                'type3': x[2].type}))
             self.angles_typed[x] = self.ff.angle_types[-1]
 
         for x in propers:
@@ -2711,20 +2928,43 @@ class Compound(object):
             if close(cv1, 0) or close(cv2, 0):
                 continue
             mag = dihed_angle(coords, 0)
-            if close(mag, 0) or close(np.abs(mag), np.pi):
-                continue
-                
-            self.ff.proper_types.append({'k':str(kd), 'phi':str(math.degrees(abs(mag[0]))), 'type1':x[0].type['name'],
-                                        'type2':x[1].type['name'], 'type3':x[2].type['name'], 'type4':x[3].type['name']})
+            # if close(mag, 0) or close(np.abs(mag), np.pi):
+            #     continue
+
+            self.ff.proper_types.append(
+                defaultdict(lambda: '', {'k': str(kd), 'rest': str(math.degrees((mag[0]))), 'type1': x[0].type,
+                                         'type2': x[1].type, 'type3': x[2].type,
+                                         'type4': x[3].type}))
             self.propers_typed[x] = self.ff.proper_types[-1]
 
 
+    def create_bonding_all2(self, kb=300, ka=500, kd=500):
+        import pymatgen.core.periodic_table as pt
+        nlst = list(self.bond_graph.nodes())
+        for i, part1 in enumerate(nlst):
+            for part2 in nlst[i + 1:]:
+                tmp = nx.all_simple_paths(self.bond_graph, part1, part2, 4)  # type: list
+                for ipath in tmp:
+                    if len(ipath) == 2:
+                        self.bonds.append(Bond(ipath))
+                    elif len(ipath) == 3:
+                        self.angles.append(Angle(ipath))
+                    elif len(ipath) == 4:
+                        self.diheds.append(Dihed(ipath))
+        for x in self.bonds:
+            x.params = {'k': kb, 'rest': x.len}
+        for x in self.angles:
+            x.params = {'k': ka, 'rest': x.ang}
+        for x in self.diheds:
+            x.params = {'k': kd, 'rest': x.phi}
+
+            
     def rm_redun_cons(self):
         '''remove redundant connections. Note that we assume here that #of cons=# of con types for b/a/d'''
         nlst = self.particles_label_sorted()
         n = self.n_particles()
         qlist = [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
-        B=[]
+        B = []
         removed = []
         angles, diheds = [], []
         for cnt, x in enumerate(qlist):
@@ -2732,7 +2972,7 @@ class Compound(object):
             for v in x:
                 tmp = nlst.index(v)
                 idx.extend([3 * tmp, 3 * tmp + 1, 3 * tmp + 2])
-            jac = np.zeros(3*n)
+            jac = np.zeros(3 * n)
             if len(x) == 2:
                 img = self.closest_img_bond
                 fun = bond_length
@@ -2764,9 +3004,9 @@ class Compound(object):
         nlst = self.particles_label_sorted()
         n = self.n_particles()
         qlist = [*self.bonds_typed, *self.angles_typed, *self.propers_typed]
-        B=np.zeros([3*n-6, 3*n])
-        grad = np.zeros(3*n-6)
-        hessian = np.zeros([3*n, 3*n])
+        B = np.zeros([len(qlist), 3 * n])  # in a determinate structure, len(qlist) = 3*n-6
+        grad = np.zeros(len(qlist))
+        hessian = np.zeros([3 * n, 3 * n])
         K = deepcopy(hessian)
         for cnt, x in enumerate(qlist):
             idx = []
@@ -2796,32 +3036,46 @@ class Compound(object):
                 sderiv *= -1
 
             sderiv = sderiv.reshape([-1, 3 * len(x)])
-            if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
-                                np.isclose(mag, np.pi, atol=1e-15, rtol=0)): #or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
-                fderiv = np.zeros(fderiv.shape)
-                sderiv = np.zeros(sderiv.shape)
+            # if len(x) == 4 and (np.isclose(mag, 0, atol=1e-15, rtol=0) or
+            #                     np.isclose(mag, np.pi, atol=1e-15, rtol=0)): #or np.allclose(cv1, 0, atol=.0001) or np.allclose(cv2, 0, atol=.0001)):
+            #     fderiv = np.zeros(fderiv.shape)
+            #     sderiv = np.zeros(sderiv.shape)
             hessian[np.ix_(idx, idx)] = sderiv * 2 * k * (mag - mag0)
             K += hessian
         return B, K
 
-
-    def hessx_to_internal(self, Hx):
+    def get_stiffnesses(self, Hx, hx):
         B, K = self.getB()
+
+        idx, _ = rm_dependent_rows(hx)
+        B = B[:, idx]
+        K = K[np.ix_(idx, idx)]
+        Hx = Hx[np.ix_(idx, idx)]
+
+        return inv(B.T ** 2) @ np.diag(Hx)
+
+    def hessx_to_internal(self, Hx, hx=None):
+        '''hx: the hessian that should be used to remove DoFs to make the structure stable'''
+        B, K = self.getB()
+        if hx is not None:
+            idx, _ = rm_dependent_rows(hx)
+            B = B[:, idx]
+            K = K[np.ix_(idx, idx)]
+            Hx = Hx[np.ix_(idx, idx)]
 
         Binv = np.linalg.pinv(B)
 
-        return Binv.T @ (Hx - K) @ Binv   # eq 10 in "the efficient optimiztion of molecular geometries using redundant . . . "
-
-
+        return Binv.T @ (
+                    Hx - K) @ Binv  # eq 10 in "the efficient optimiztion of molecular geometries using redundant . . . "
 
     def gen_angs_and_diheds(self):
         angles = OrderedSet()
         propers = OrderedSet()
         nlst = list(self.particles(0))
         for i, part1 in enumerate(nlst):
-            for part2 in nlst[i+1:]:
+            for part2 in nlst[i + 1:]:
                 try:
-                    tmp = nx.all_simple_paths(self.bond_graph, part1, part2, 4) # type: list
+                    tmp = nx.all_simple_paths(self.bond_graph, part1, part2, 4)  # type: list
                 except nx.exception.NodeNotFound:
                     continue
                 for ipath in list(tmp):
@@ -2829,29 +3083,34 @@ class Compound(object):
                         angles.add(tuple([x for x in ipath]))
                     elif len(ipath) == 4:
                         propers.add(tuple([x for x in ipath]))
-        self.angles_typed = OrderedDict()
-        self.propers_typed = OrderedDict()
+
+        for b in self.bond_graph.edges:
+            for btype in self.ff.bond_types:
+                vals = [btype[f'type{i}'] for i in range(1, 3)]
+                if [x.name for x in b] in (vals, vals[::-1]):
+                    self.bonds_typed[b] = btype
+
         for a in angles:
             for atype in self.ff.angle_types:
-                vals = [atype[f'type{i}'] for i in range(1,4)]
-                if [x.type['name'] for x in a] in (vals,vals[::-1]):
+                vals = [atype[f'type{i}'] for i in range(1, 4)]
+                if [x.name for x in a] in (vals, vals[::-1]):
                     self.angles_typed[a] = atype
 
         for p in propers:
             for ptype in self.ff.proper_types:
                 vals = [ptype[f'type{i}'] for i in range(1, 5)]
-                if [x.type['name'] for x in p] in (vals, vals[::-1]):
+                if [x.name for x in p] in (vals, vals[::-1]):
                     self.propers_typed[p] = ptype
 
-    def applyff(self,file):
+    def applyff(self, file):
         from foyer.forcefield import Forcefield
         from foyer.smarts_graph import SMARTSGraph
         from networkx.algorithms.isomorphism import GraphMatcher
-        
+
         self.ff = Forcefield(file)
 
         self.typemap = {x: {'whitelist': set(), 'blacklist': set(),
-                       'atomtype': None} for x in self.particles(0)}
+                            'atomtype': None} for x in self.particles(0)}
 
         for x in self.ff.atom_types:
             x['graph'] = SMARTSGraph(smarts_string=x['def'],
@@ -2863,13 +3122,13 @@ class Compound(object):
         nlst = list(self.particles(0))
         # initialize atom types
         for x in nlst:
-            x.type=[]
+            x.type = []
 
         for n in nlst:
-            self.bond_graph.add_node(n,atom=n)
+            self.bond_graph.add_node(n, atom=n)
 
         for type in self.ff.atom_types:
-            gm = GraphMatcher(self.bond_graph,type['graph'],node_match=self._node_match)
+            gm = GraphMatcher(self.bond_graph, type['graph'], node_match=self._node_match)
             matches = {y[0] for x in gm.subgraph_isomorphisms_iter() for y in x.items() if y[1] == 0}
             for atom in matches:
                 atom.type.append(type)
@@ -2882,9 +3141,6 @@ class Compound(object):
         # create angles and dihedrals
         self.gen_angs_and_diheds()
 
-        self.nonbond_typed = OrderedDict()
-        self.bonds_typed = OrderedDict()
-
         for p in self.particles():
             for nb_type in self.ff.nonbond_types:
                 if p.type['name'] == nb_type['type']:
@@ -2893,11 +3149,11 @@ class Compound(object):
 
         for b in self.bond_graph.edges:
             for btype in self.ff.bond_types:
-                if {x.type['name'] for x in b} == {btype[x] for x in ['type1','type2']}:
+                if {x.type['name'] for x in b} == {btype[x] for x in ['type1', 'type2']}:
                     self.bonds_typed[b] = btype
 
     def write_lammpsdata(self, filename='data.dat', lj=1, elec=1, bond=1, angle=1, prop=1, atom_style='full',
-                        unit_style='real', buff=0):
+                         unit_style='real', buff=0):
         """Output a LAMMPS data file.
 
         Parameters
@@ -2921,14 +3177,18 @@ class Compound(object):
             mass_conversion_factor = np.max([atom.mass for atom in structure.atoms])
 
             xyz = xyz / sigma_conversion_factor
-            charges = (charges*1.6021e-19) / np.sqrt(4*np.pi*(sigma_conversion_factor*1e-10)*
-              (epsilon_conversion_factor*4184)*epsilon_0)
+            charges = (charges * 1.6021e-19) / np.sqrt(4 * np.pi * (sigma_conversion_factor * 1e-10) *
+                                                       (epsilon_conversion_factor * 4184) * epsilon_0)
             charges[np.isinf(charges)] = 0
             # TODO: FIX CHARGE UNIT CONVERSION
         else:
             sigma_conversion_factor = 1
             epsilon_conversion_factor = 1
             mass_conversion_factor = 1
+
+        atoms = self.particles_label_sorted()
+        types, idx = make_unique([x.elem for x in atoms])
+        # elems, idx = make_unique([x.elem for x in atoms])
 
         with open(filename, 'w') as data:
             data.write(f'''{filename} - created by mBuild; units = {unit_style}
@@ -2937,54 +3197,57 @@ class Compound(object):
 {len(self.angles_typed)} angles
 {len(self.propers_typed)} dihedrals
 
-{len(self.ff.atom_types)} atom types
+{len(types)} atom types
 {len(self.ff.bond_types)} bond types
 {len(self.ff.angle_types)} angle types
 {len(self.ff.proper_types)} dihedral types\n\n''')
 
-            lo = np.min(self.xyz,axis=0)
+            lo = np.min(self.xyz, axis=0)
             hi = np.diag(self.latmat)
             for i, dim in enumerate(['x', 'y', 'z']):
-                data.write(f'{lo[i]-buff:.6f} {lo[i]+hi[i]+buff:.6f} {dim}lo {dim}hi\n')
+                data.write(f'{lo[i] - buff:.6f} {lo[i] + hi[i] + buff:.6f} {dim}lo {dim}hi\n')
             # Box data
-            if not np.allclose(self.latmat-np.diag(np.diagonal(self.latmat)),np.zeros([3,3])):
+            if not np.allclose(self.latmat - np.diag(np.diagonal(self.latmat)), np.zeros([3, 3])):
                 data.write('{0:.6f} {1:.6f} {2:6f} xy xz yz\n'.format(
-                    *latmat[np.tril_indices(3,k=-1)].tolist()))
+                    *latmat[np.tril_indices(3, k=-1)].tolist()))
 
             data.write('\nMasses\n\n')
-            for i,type in enumerate(self.ff.atom_types,1):
-                data.write(f'{i}\t{type["mass"]}\t# {type["name"]}\n')
-
+            for i, j in enumerate(idx, 1):
+                data.write(f'{i}\t{atoms[j].mass}\t# {atoms[j].name}\n')
 
             data.write('\nPair Coeffs # real \n')
             data.write('#\tepsilon (kcal/mol)\t\tsigma (Angstrom)\n')
 
             if self.ff.nonbond_types:
-                for i,y in enumerate(self.ff.atom_types,1):
-                    nb = [x for x in self.ff.nonbond_types if x['type'] == y['name']][0]
-                    data.write(f"{i}\t{nb['epsilon'] if lj else 0}\t\t{nb['sigma']}\t\t# {nb['type']}\n")
+                gg = [x for x in self.ff.nonbond_types if 'a' in x]
+                for i, y in enumerate(types, 1):
+                    nb = [x for x in gg if x['type'] == y][0]
+                    data.write(
+                        f"{i}\t{str(float(nb['a'])) if lj else 0}\t\t{nb['b']}\t\t# {nb['type']}\n")  # *23.06037352
+                    # u.AVOGADRO_CONSTANT_NA._value * (1 * u.elementary_charge * u.volts).in_units_of(u.kilocalorie)._value
 
             # Bond coefficients
             data.write('\nBond Coeffs # harmonic\n')
             data.write('#\tk(kcal/mol/angstrom^2)\t\treq(angstrom)\n')
-            for i,y in enumerate(self.ff.bond_types,1):
-                data.write(f"{i}\t{y['k'] if bond else 0}\t{y['length']}\t# {y['type1']}\t{y['type2']}\n")
+            for i, y in enumerate(self.ff.bond_types, 1):
+                data.write(f"{i}\t{y['k'] if bond else 0}\t{y['r0']}\t# {y['type1']}\t{y['type2']}\n")
 
             # Angle coefficients
             if self.ff.angle_types:
                 data.write('\nAngle Coeffs # harmonic\n')
                 data.write('#\tk(kcal/mol/rad^2)\t\ttheteq(deg)\tk(kcal/mol/angstrom^2)\treq(angstrom)\n')
-                for i,y in enumerate(self.ff.angle_types,1):
-                    data.write(f"{i}\t{y['k'] if angle else 0}\t\t{y['angle']}\t# {y['type1']}\t{y['type2']}\t{y['type3']}\n")
+                for i, y in enumerate(self.ff.angle_types, 1):
+                    data.write(
+                        f"{i}\t{y['k'] if angle else 0}\t\t{y['r0']}\t# {y['type1']}\t{y['type2']}\t{y['type3']}\n")
 
             # Dihedral coefficients
             if self.ff.proper_types:
                 data.write('\nDihedral Coeffs # harmonic\n')
                 data.write('#k, d, n\n')
-                for i,y in enumerate(self.ff.proper_types,1):
-                    keys = [x for x in y.keys() if 'type' not in x]
-                    data.write(f"{i}\t "+(len(keys)*'{} ').format(*[y[z] for z in keys])
-                               +f"\t# {y['type1']}\t{y['type2']}\t{y['type3']}\t{y['type4']}\n")
+                for i, y in enumerate(self.ff.proper_types, 1):
+                    keys = [x for x in y.keys() if 'type' not in x and not bool(re.search('^f', x))]
+                    data.write(f"{i}\t " + (len(keys) * '{} ').format(*[y[z] for z in keys])
+                               + f"\t# {y['type1']}\t{y['type2']}\t{y['type3']}\t{y['type4']}\n")
 
             # Atom data
             data.write('\nAtoms\n\n')
@@ -2999,43 +3262,51 @@ class Compound(object):
                 atom_line = '{index:d}\t{zero:d}\t{type_index:d}\t{x:.6f}\t{y:.6f}\t{z:.6f}\n'
             elif atom_style == 'full':
                 if unit_style == 'real':
-                    atom_line ='{index}\t{zero}\t{type_index}\t{charge}\t{x:.7f}\t{y:.7f}\t{z:.7f}\t#{t}\n'
+                    atom_line = '{index}\t{zero}\t{type_index}\t{charge}\t{x:.7f}\t{y:.7f}\t{z:.7f}\t#{t}\n'
                 elif unit_style == 'lj':
-                    atom_line ='{index:d}\t{zero:d}\t{type_index:d}\t{charge:.4e}\t{x:.6f}\t{y:.6f}\t{z:.6f}\n'
+                    atom_line = '{index:d}\t{zero:d}\t{type_index:d}\t{charge:.4e}\t{x:.6f}\t{y:.6f}\t{z:.6f}\n'
 
             nlst = self.particles_label_sorted()
             comps = list(nx.connected_components(self.bond_graph))
 
-            for i,p in enumerate(nlst,1):
+            for i, p in enumerate(nlst, 1):
+                try:
+                    chg = [x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0]
+                except:
+                    try:
+                        chg = float(p.type['charge'])
+                    except:
+                        chg = p.charge
+
                 data.write(atom_line.format(
-                    index=i,type_index=self.ff.atom_types.index(p.type)+1,
+                    index=i, type_index=types.index(p.elem) + 1,
                     zero=[i for i in range(len(comps)) if p in comps[i]][0],
-                    charge=[x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0] if elec else 0,
-                    x=p.pos[0],y=p.pos[1],z=p.pos[2],t=p.type['name']))
+                    charge=chg if elec else 0,
+                    x=p.pos[0], y=p.pos[1], z=p.pos[2], t=p.name))
 
             if atom_style in ['full', 'molecular']:
                 # Bond data
                 # if bond:
                 data.write('\nBonds\n\n')
-                for i,bond in enumerate(self.bonds_typed.items(),1):
-                    bidx=[nlst.index(j)+1 for j in bond[0]]
-                    data.write(f"{i}\t{self.ff.bond_types.index(bond[1])+1}\t"
+                for i, bond in enumerate(self.bonds_typed.items(), 1):
+                    bidx = [nlst.index(j) + 1 for j in bond[0]]
+                    data.write(f"{i}\t{self.ff.bond_types.index(bond[1]) + 1}\t"
                                f"{bidx[0]}\t{bidx[1]}\n")
 
                 # Angle data
                 if self.ff.angle_types and self.angles_typed:
                     data.write('\nAngles\n\n')
                     for i, angle in enumerate(self.angles_typed.items(), 1):
-                        aidx=[nlst.index(j)+1 for j in angle[0]]
-                        data.write(f"{i}\t{self.ff.angle_types.index(angle[1])+1}\t"
+                        aidx = [nlst.index(j) + 1 for j in angle[0]]
+                        data.write(f"{i}\t{self.ff.angle_types.index(angle[1]) + 1}\t"
                                    f"{aidx[0]}\t{aidx[1]}\t{aidx[2]}\n")
 
                 # Dihedral data
                 if self.ff.proper_types and self.propers_typed:
                     data.write('\nDihedrals\n\n')
-                    for i,prop in enumerate(self.propers_typed.items(),1):
-                        pidx=[nlst.index(j)+1 for j in prop[0]]
-                        data.write(f"{i}\t{self.ff.proper_types.index(prop[1])+1}\t"
+                    for i, prop in enumerate(self.propers_typed.items(), 1):
+                        pidx = [nlst.index(j) + 1 for j in prop[0]]
+                        data.write(f"{i}\t{self.ff.proper_types.index(prop[1]) + 1}\t"
                                    f"{pidx[0]}\t{pidx[1]}\t{pidx[2]}\t{pidx[3]}\n")
 
     def get_bond_lengths(self, bonds):
@@ -3115,15 +3386,15 @@ class Compound(object):
             except KeyError:
                 message = 'The code at {filename}:{line_number} requires the ' + module + ' package'
                 e = ImportError('No module named %s' % module)
-        
+
             frame, filename, line_number, function_name, lines, index = \
                 inspect.getouterframes(inspect.currentframe())[1]
-        
+
             m = message.format(filename=os.path.basename(filename), line_number=line_number)
             m = textwrap.dedent(m)
-        
+
             bar = '\033[91m' + '#' * max(len(line) for line in m.split(os.linesep)) + '\033[0m'
-        
+
             print('', file=sys.stderr)
             print(bar, file=sys.stderr)
             print(m, file=sys.stderr)
@@ -3186,7 +3457,8 @@ class Compound(object):
         box_maxs -= edge
 
         # Build the input file for each compound and call packmol.
-        solute_xyz, solvated_xyz = [open(os.path.abspath(x), 'w') for x in ('tmp_solute.xyz', 'tmp_solvated.xyz')]#tempfile.NamedTemporaryFile(suffix='.xyz', delete=False)
+        solute_xyz, solvated_xyz = [open(os.path.abspath(x), 'w') for x in (
+        'tmp_solute.xyz', 'tmp_solvated.xyz')]  # tempfile.NamedTemporaryFile(suffix='.xyz', delete=False)
 
         # generate list of temp files for the solvents
         solvent_xyz_list = list()
@@ -3194,22 +3466,23 @@ class Compound(object):
         input_text = (f'tolerance {overlap:.16f} \n'
                       f'filetype xyz \n'
                       f'output {solvated_xyz.name} \n'
-                      f'seed {seed}\n') #+
-# """
-# structure {0}
-#     number 1
-#     center
-#     fixed {1:.3f} {2:.3f} {3:.3f} 0. 0. 0.
-# end structure
-# """.format(solute_xyz.name, *center_solute))
+                      f'seed {seed}\n')  # +
+        # """
+        # structure {0}
+        #     number 1
+        #     center
+        #     fixed {1:.3f} {2:.3f} {3:.3f} 0. 0. 0.
+        # end structure
+        # """.format(solute_xyz.name, *center_solute))
 
-        for i,(solv, m_solvent, rotate) in enumerate(zip(solvent, n_solvent, fix_orientation)):
-             m_solvent = int(m_solvent)
+        for i, (solv, m_solvent, rotate) in enumerate(zip(solvent, n_solvent, fix_orientation)):
+            m_solvent = int(m_solvent)
 
-             solvent_xyz = open(os.path.abspath('tmp_solvent_'+str(i)+'.xyz'), 'w')#tempfile.NamedTemporaryFile(suffix='.xyz', delete=False)
+            solvent_xyz = open(os.path.abspath('tmp_solvent_' + str(i) + '.xyz'),
+                               'w')  # tempfile.NamedTemporaryFile(suffix='.xyz', delete=False)
 
-             solv.write_xyz(solvent_xyz.name)
-             input_text += """
+            solv.write_xyz(solvent_xyz.name)
+            input_text += """
 structure {0}
     number {1:d}
     inside box {2:.3f} {3:.3f} {4:.3f} {5:.3f} {6:.3f} {7:.3f}
@@ -3220,12 +3493,12 @@ end structure
         tmp = compload(solvated_xyz.name)
         tmp.latmat = self.latmat
         initself = deepcopy(self)
-        added = [] #future: remove water molecules that are close due to periodic boundary conditions.
+        added = []  # future: remove water molecules that are close due to periodic boundary conditions.
         for comp, m_compound in zip(solvent, n_solvent):
 
             for i in range(m_compound):
-                coords = tmp.xyz[i*comp.n_particles():(i+1)*comp.n_particles()]
-                _,out = self.neighbs(coords,initself.particles(), rcut=1.5)
+                coords = tmp.xyz[i * comp.n_particles():(i + 1) * comp.n_particles()]
+                _, out = self.neighbs(coords, initself.particles(), rcut=1.5)
 
                 if not list(chain.from_iterable(out)):
                     cop = deepcopy(comp)
@@ -3260,14 +3533,14 @@ end structure
                      stdin=PIPE, stdout=PIPE, stderr=PIPE,
                      universal_newlines=True, shell=True)
         out, err = proc.communicate()
-        
+
         # if 'WITHOUT PERFECT PACKING' in out:
         #     msg = ("Packmol finished with imperfect packing. Using "
         #            "the .xyz_FORCED file instead. This may not be a "
         #            "sufficient packing result.")
         #     warnings.warn(msg)
         #     os.system('cp {0}_forced {0}'.format(filled_xyz.name))
-        
+
         if 'ERROR' in out or proc.returncode != 0:
             _packmol_error(out, err)
 
@@ -3280,18 +3553,21 @@ end structure
         particles = group if group else self.particles()
 
         return np.sum(np.array([self.nonbond_typed[x]['charge'] for x in particles], dtype=float))
-    
-    
+
     def total_dipole(self, dir, group=None):
         '''only makes sense after applyff'''
-        
+
         particles = group if group else self.particles()
-        
+
         total_dipole = 0.0
         for i, p in enumerate(particles):
-            total_dipole += eval([x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0]) * p.pos[dir] 
-        return total_dipole        
-    
+            total_dipole += eval([x['charge'] for x in self.ff.nonbond_types if p.type['name'] == x['type']][0]) * \
+                            p.pos[dir]
+        return total_dipole
+
+    @property
+    def elems(self):
+        return OrderedSet([x.name for x in self.particles_label_sorted()])
 
     def neutralize(self, types=None):
         '''only makes sense after applyff'''
@@ -3302,87 +3578,162 @@ end structure
             if x.type in types:
                 cnt += 1
 
-        adjust = -self.total_charge()/cnt
+        adjust = -self.total_charge() / cnt
         for x in types:
             for y in self.ff.nonbond_types:
                 if x['name'] == y['type']:
-                   y['charge'] = str(float(y['charge']) + adjust)
+                    y['charge'] = str(float(y['charge']) + adjust)
 
-    def write_gulp(self, direc='.', ordered=1,
-                   keys='''opti conp molmec fix noautobond nosym norepulsive_cutoff prop thermal  & \nfreq  eigen lower optlower kcal conj\n\n'''):
+    def write_gulp(self, direc='gulp.in', ordered=1, misc='', coords=None, obs=[None], obs_atoms=None,
+                   keys='''opti conp molmec fix noautobond nosym norepulsive_cutoff prop thermal  & \nfreq  eigen lower optlower kcal conj\n\n'''
+                   , opts=''):
+        parts = self.particles_label_sorted()
+        if not obs_atoms:
+            obs_atoms = parts
+        fit = 'fit' in keys
+        types, _ = equivalence_classes(parts, lambda x, y: x.elem == y.elem)
 
-        types = equivalence_classes(self.ff.atom_types, lambda x,y: x['element']==y['element'])
-        
-        type_map = dict()
+        out = keys
+        out += '\n\nelement\n'
         for x in types:
-            for i,y in enumerate(x, 1):
-                type_map[y['name']] = y['element']+str(i)
-        with open(os.path.join(direc, 'gulp.in'), 'w') as f:
-            f.write(keys)
-            f.write('\n\nelement\n')
-            for x in types:
-                f.write(f"mass {x[0]['element']} {x[0]['mass']}\n")
-            f.write("end \n\nvector\n")
-            f.write((3*(3*'{} '+'\n')).format(*self.latmat.flatten()))
-            
-            f.write('\ncart\n')
-            for x in self.particles_label_sorted() if ordered else self.particles():
-                f.write(f'{type_map[x.type["name"]]:4}' + (3*'{:7f}  '+'\n').format(*x.pos))
+            out += f"mass {x[0].elem} {x[0].mass}\n"
+        out += 'end \n'
 
-            f.write('\n')
-            bonds,_ = self.bonds_angles_index()
+        if coords is None:
+            coords = [self.xyz_label_sorted if ordered else self.xyz]
+            frcs = [np.zeros(coords[0].shape)]
+        for cnt, (frame, frc) in enumerate(zip(coords, obs), 1):
+            out += f"\nvector  # config  {cnt}\n"
+            out += (3 * (3 * '{} ' + '\n')).format(*self.latmat.flatten())
+            if fit:
+                out += ' 0  0  0  0  0  0'
+            out += '\ncart\n'
+            for x, y in zip(parts, frame):
+                out += f'{x.name:4}' + (3 * '{:7f}  ' + '{} ').format(*y, x.charge)
+                if fit:
+                    out += ' 0 0 0 \n' if x in obs_atoms else ' 0 0 0 \n'
+                else:
+                    out += '\n'
+
+            out += '\n'
+            bonds, _ = self.bonds_angles_index()
             for x in bonds + 1:
-                f.write('connect {} {}\n'.format(*x))
+                out += 'connect {} {}\n'.format(*x)
+            out += '\n'
 
-            if self.ff.nonbond_types:
-                f.write("\nepsilon/sigma kcal\n")
-                for x in self.ff.nonbond_types:
-                    f.write(f"{type_map[x['type']]}  {x['epsilon']}  {x['sigma']} \n")
+            if fit:
+                out += '\nobservables\n'
+                if 'obsener' in misc:
+                    out += f'energy \n{obs[cnt - 1]} \n'
+                else:
+                    out += 'gradient ev/angs\n'
+                    frc = [np.insert(y, 0, parts.index(x) + 1) for x, y in zip(obs_atoms, frc)]
+                    for x in frc:
+                        out += ('{:<4d} ' + 3 * '{:<10.6e}  ').format(int(x[0]), *x[1:]) + '\n'
 
-                f.write("\nlenn epsilon zero product 12  6 x13 kcal all\n")
-                f.write('12\n')
-                
-            f.write("\nharmonic intra bond kcal\n" if self.ff.bond_types else '')
-            for x in self.ff.bond_types:
-                f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {2*float(x['k'])}  {x['length']}  0   \t# {x['type1']}\t{x['type2']}\n")
+                out += 'end\n'
 
-            f.write("\nthree bond intra regular kcal\n" if self.ff.angle_types else '')
-            for x in self.ff.angle_types:
-                f.write(f"{type_map[x['type2']]} {type_map[x['type1']]}  {type_map[x['type3']]}  {2*float(x['k'])}  {x['angle']}  \t# {x['type1']}\t{x['type2']}\t{x['type3']}\n")
+                # if you want to set weights instead
+                #                     for cc, x, y in zip(range(1, len(frc)+1), parts, frc):
+                #     f.write(f'{cc:<4d} ' + (3*'{:<10.6e}  ').format(*y) + (' 1 ' if x in obs_atoms else '0 ') + '\n')
+                # f.write('end\n')
 
-            f.write('\n torharm intra bond kcal\n' if self.ff.proper_types else '')
-            for x in self.ff.proper_types:
-                keys = [y for y in x.keys() if 'type' not in y]
-                f.write(f"{type_map[x['type1']]} {type_map[x['type2']]}  {type_map[x['type3']]} {type_map[x['type4']]} "+ (len(keys)*'{} ').format(*[x[z] for z in keys]) +f"\t# {x['type1']}\t{x['type2']}\t{x['type3']}\t{x['type4']}\n")
-            f.write('\n slower .05')
-            f.write('\noutput movie xyz')
+        vals = [x for x in self.ff.nonbond_types if 'a' in x]
+        if vals:
+            out += 'atomab\n'
+            for x in vals:
+                out += f"{x['type']}  {x['a']}  {x['b']} " + (' 0 0 \n' if 'fit' in keys else '\n')
+            out += '\nlenn x14 kcal all combine \n12\n\n'
 
+        vals = [x for x in self.ff.nonbond_types if 'c6' in x]
+        if vals:
+            out += 'grimme_c6 x14 kcal\n'
+            for x in vals:
+                out += f"{x['type1']}  {x['type2']}  {x['c6']}  {x['d']}  {x['r0']} 12" + (
+                    '0 0 0 \n' if 'fit' in keys else '\n')
+            out += '\n'
 
-    def rotate_vecs(self, v1, v2, pnt=None):
-        ''' rotates the particles according to the angle between v1 and v2'''
+        flg = 0
+        out += "harmonic intra bond kcal\n" if self.ff.bond_types else ''
+        for cnt, x in enumerate(self.ff.bond_types, 1):
+            out += f"{x['type1']} {x['type2']}  " \
+                   f"{2 * float(x['k'])}  {x['r0']}  0  {x['f1']} {x['f2']} \n"
+
+        out += "\nthree bond intra regular kcal\n" if self.ff.angle_types else ''
+        for cnt, x in enumerate(self.ff.angle_types, 1):
+            out += f"{x['type2']} {x['type1']}  {x['type3']}  " \
+                   f"{2 * float(x['k'])}  {x['r0']}  {x['f1']} {x['f2']}\n"
+
+        out += '\ntorharm intra bond kcal\n' if self.ff.proper_types else ''
+        for cnt, x in enumerate(self.ff.proper_types, 1):
+            kk = [y for y in x.keys() if 'type' not in y]
+            out += f"{x['type1']} {x['type2']}  {x['type3']} {x['type4']} " \
+                   f"{2 * float(x['k'])}  {x['r0'].replace('-', '')}" + f" {x['f1']} {x['f2']} \n"
+        out += '\n' if 'torharm' in out else ''
+        # out += '\n slower .05'
+        # out += '\noutput movie xyz'
+        out += opts
+
+        open(direc, 'w').write(out)
+        return out
+
+    def rotate_vecs(self, v1, v2, pnt=None, rotpnt=None):
+        ''' rotates the particles according to the angle between v1 and v2
+            rotpnt: rotate around this point'''
         v1, v2 = map(np.array, [v1, v2])
-        v1, v2 = map(lambda x:x/norm(x), [v1, v2])
+        v1, v2 = map(lambda x: x / norm(x), [v1, v2])
         normal = np.cross(v1, v2)
         if np.allclose(normal, 0):
-            if not np.array_equal(pnt, None):
+            if pnt is not None:
                 self.reflect(pnt, v1)
             return
-        rot = R.from_rotvec(normal*angle_between_vecs(v1, v2, degrees=0)/norm(normal))
-        self.xyz_with_ports = rot.apply(self.xyz_with_ports)
+        rot = R.from_rotvec(normal * angle_between_vecs(v1, v2, degrees=0) / norm(normal))
+        self.xyz_with_ports = rot.apply(self.xyz_with_ports - rotpnt.pos) + rotpnt.pos
         for x in [x for x in self.particles(1) if '!' in x.name]:
             x.orientation = rot.apply(x.orientation)
 
-    def rotate_around(self, vec, ang, degrees=1):
-        ''' rotate compound about an axis'''
+    def rotate_around(self, vec, ang, degrees=1, pnt=[0, 0, 0]):
+        ''' rotate compound about an axis
+            pnt: point to rotate around
+            vec: cant be two atoms. rotation is done around their cross product'''
+        if len(vec) == 2 and vec[0] is Compound:
+            vec = cross(vec[0].pos, vec[1].pos)
+        if isinstance(pnt, Compound):
+            pnt = pnt.pos
         vec = np.array(vec)
-        vec = vec/norm(vec)
+        vec = vec / norm(vec)
         if degrees:
             ang = math.radians(ang)
-        rot = R.from_rotvec(vec*ang)
-        self.xyz_with_ports = rot.apply(self.xyz_with_ports)
+        rot = R.from_rotvec(vec * ang)
+        self.xyz_with_ports = rot.apply(self.xyz_with_ports - pnt) + pnt
         for x in [x for x in self.particles(1) if '!' in x.name]:
             x.orientation = rot.apply(x.orientation)
 
+    def make_ortho(self, max=10, only_nn=0):
+        '''only_nn: just returns the mno needed and doesn't make self into supercell'''
+        olat = self.latmat  # old latmat
+
+        a, b, c = np.meshgrid(range(-max, max + 1), range(-max, max + 1), range(-max, max + 1))
+        v = 1e14
+        latmat = np.zeros([3, 3])
+        # p = list(product(a.flatten(), b.flatten(), c.flatten()))
+
+        nrms = np.ones(3) * 1e14
+        fvec = deepcopy(latmat)
+        nn = deepcopy(latmat)
+        for i in range(3):
+            for x in zip(a.flatten(), b.flatten(), c.flatten()):
+                vec = x @ olat
+                idx = [[1, 2], [0, 2], [0, 1]]
+                nrm = norm(vec)
+                if np.abs(vec[idx[i][0]]) < .1 and np.abs(vec[idx[i][1]]) < .1 and nrm > 1 and nrm < nrms[i] and np.all(
+                        vec > -.1):
+                    fvec[i] = vec
+                    nrms[i] = nrm
+                    nn[i] = x
+
+        if not only_nn:
+            self.supercell(nn)
 
 
 class Box:
@@ -3448,7 +3799,6 @@ class Box:
     def ylo_bound(self):
         return self.ylo + np.min([0, self.yz])
 
-
     @property
     def xhi_bound(self):
         return self.xhi + np.max([0.0, self.xy, self.xz, self.xy + self.xz])
@@ -3495,40 +3845,98 @@ class Port(Compound):
         A Particle associated with the port. Used to form bonds.
 
     """
-    def __init__(self, anchor=None, orientation=[1, 0, 0], pos=[0, 0, 0], name='p!'):
+
+    def __init__(self, anchor=None, orientation=[1, 0, 0], pos=None, name='p!'):
+        if pos is None:
+            pos = anchor.pos
 
         orientation, loc_vec = map(np.asarray, [orientation, pos])
 
         super(Port, self).__init__(name=name, pos=pos)
         self.anchor, self.orientation = anchor, orientation / norm(orientation)
-        
+
+
 class FF():
     """
     """
+
     def __init__(self):
-        
-        self.atom_types,self.nonbond_types,self.bond_types,self.angle_types,self.proper_types = [[], [], [], [], []]
-        
+
+        self.atom_types, self.nonbond_types, self.bond_types, self.angle_types, self.proper_types = [[], [], [], [], []]
+        self.pair_style = ''
+        self.bond_style = ''
+        self.angle_style = ''
+        self.dihedral_style = ''
+
     def read_xml(self, file):
         # start of my additions:
-        ff = et.parse(file) # type: et.ElementTree
-        self.atom_types = [defaultdict(lambda: None,x.attrib) for x in ff.getroot().find('AtomTypes').getchildren()]
+        ff = et.parse(file)  # type: et.ElementTree
+        self.atom_types = [defaultdict(lambda: None, x.attrib) for x in ff.getroot().find('AtomTypes').getchildren()]
         try:
-            self.nonbond_types = [defaultdict(lambda: None,x.attrib) for x in ff.getroot().find('NonbondedForce').getchildren()]
+            self.nonbond_types = [defaultdict(lambda: None, x.attrib) for x in
+                                  ff.getroot().find('NonbondedForce').getchildren()]
         except:
             self.nonbond_types = []
         try:
-            self.bond_types = [defaultdict(lambda: None,x.attrib) for x in ff.getroot().find('HarmonicBondForce').getchildren()]
+            self.bond_types = [defaultdict(lambda: None, x.attrib) for x in
+                               ff.getroot().find('HarmonicBondForce').getchildren()]
         except:
             self.bond_types = []
         try:
-            self.angle_types = [defaultdict(lambda: None,x.attrib) for x in ff.getroot().find('HarmonicAngleForce').getchildren()]
+            self.angle_types = [defaultdict(lambda: None, x.attrib) for x in
+                                ff.getroot().find('HarmonicAngleForce').getchildren()]
         except AttributeError:
             self.angle_types = []
         tmp = ff.getroot().find('PeriodicTorsionForce')
         try:
-            self.proper_types = [defaultdict(lambda: None,x.attrib) for x in tmp.getchildren()] if len(tmp) else []
+            self.proper_types = [defaultdict(lambda: None, x.attrib) for x in tmp.getchildren()] if len(tmp) else []
         except:
             self.proper_types = []
 
         # self.parser = smarts.SMARTS(self.non_element_types)
+
+class Bond():
+    def __init__(self, atoms=[]):
+        self.atoms = atoms
+
+    def __repr__(self):
+        return '<Bond: '+' - '.join([x.name for x in self.atoms]) + '>'
+
+    @property
+    def type(self):
+        return {x.type for x in self.atoms}
+
+    @property
+    def len(self):
+        return bond_length(self.atoms[0].root.closest_img_bond(*self.atoms), 0)[0]
+
+
+class Angle():
+    def __init__(self, atoms=[]):
+        self.atoms = atoms
+        
+    def __repr__(self):
+        return '<Angle: '+' - '.join([x.name for x in self.atoms]) + '>'
+
+    @property
+    def type(self):
+        return [self.atoms[1].type, {self.atoms[0].type, self.atoms[2].type}]
+
+    @property
+    def ang(self):
+        return math.degrees(bend_angle(self.atoms[0].root.closest_img_angle(*self.atoms), 0)[0])
+
+class Dihed():
+    def __init__(self, atoms=[]):
+        self.atoms = atoms
+        
+    def __repr__(self):
+        return '<Dihed: '+' - '.join([x.name for x in self.atoms]) + '>'
+
+    @property
+    def type(self):
+        return {tuple(x.type for x in self.atoms), tuple(x.type for x in self.atoms[-1::-1])}
+
+    @property
+    def phi(self):
+        return math.degrees(dihed_angle(self.atoms[0].root.closest_img_dihed(*self.atoms), 0)[0])
